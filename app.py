@@ -21,6 +21,7 @@ import importlib
 import io
 import inspect
 import json
+import logging
 import os
 import pickle
 import time
@@ -32,6 +33,8 @@ import pandas as pd
 import streamlit as st
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+
+logger = logging.getLogger(__name__)
 
 st.set_page_config(
     page_title="Commons · Category Intelligence",
@@ -103,13 +106,13 @@ GUIDE_MARKDOWN = """
 
 **Input gateway**
 - **Image**: JPG or PNG. Sideways phone photos are auto-rotated; corrupt files are rejected.
-- **Title / Description**: text clues about the picture (used as text evidence).
-- **Geotag**: `latitude, longitude`. Gives location context and a map preview.
+- **Title / Description**: text clues about the picture. The engine compares them with every category name (the META scorer).
+- **Geotag**: `latitude, longitude`. Shown as a map preview only; the current engine does not use it for ranking.
 - **Suggestions to return**: how many categories to show, best first.
 
 **Reading a result**
 - **Confidence**: the engine's overall certainty (High ≥ 80%, Medium 50–79%, Low < 50%).
-- **KNN / TXT / META**: the individual scorers: visual similarity to categorised images, text match, and metadata signals.
+- **KNN / TXT / META / CLS**: the individual scorers: similarity to already-indexed images, image-to-category-name match, title/description match, and the trained classifier (0% until you train it in Mode 3).
 - **📂 path**: where the category sits in the Commons category hierarchy.
 
 **Training terms**
@@ -304,6 +307,42 @@ def _knowledge_base_kwargs(loader: Callable[..., Any]) -> tuple[dict[str, Any], 
     return kwargs, missing
 
 
+ARTIFACT_FILES = ("faiss_index.index", "supervised_head.pth", "category_map.json", "faiss_labels.json")
+
+
+def _try_load_production_artifacts(impl: Any) -> tuple[bool, bool]:
+    """Load locally trained artifacts from artifacts/ if all four files exist.
+
+    Never raises: a missing folder, missing file or failed load is logged and the engine
+    keeps its built-in default knowledge base. Returns (loaded, tainted): `tainted` means the
+    engine's own loader started and then failed, so it may hold half-replaced state and the
+    caller should rebuild a fresh instance.
+    """
+    called = False
+    try:
+        loader = getattr(impl, "load_production_artifacts", None)
+        if not callable(loader):
+            return False, False  # older engine build without the artifacts bridge
+        folders = [Path("artifacts"), Path(__file__).resolve().parent / "artifacts"]
+        folder = next((f for f in folders if all((f / name).is_file() for name in ARTIFACT_FILES)), None)
+        if folder is None:
+            raise FileNotFoundError("artifacts/ must contain " + ", ".join(ARTIFACT_FILES))
+        called = True
+        # Positional on purpose: V1.2 names these (faiss_path, head_path, category_map_path,
+        # faiss_labels_path), so keyword names would not survive a rename.
+        loader(
+            str(folder / "faiss_index.index"),
+            str(folder / "supervised_head.pth"),
+            str(folder / "category_map.json"),
+            str(folder / "faiss_labels.json"),
+        )
+        logger.info("Loaded production artifacts from %s", folder)
+        return True, False
+    except Exception as e:
+        logger.warning(f"Artifacts not found or failed to load: {e}. Falling back to default knowledge base.")
+        return False, called
+
+
 @st.cache_resource(show_spinner=False)
 def load_backend() -> Backend:
     """Import the model once; failures remain visible but never break the UI."""
@@ -323,24 +362,35 @@ def load_backend() -> Backend:
                 # Built once per server process thanks to @st.cache_resource, so the
                 # loaded knowledge base survives every Streamlit rerun.
                 instance = engine_class()
+                # Real locally trained artifacts win when present; otherwise the engine keeps
+                # its built-in default knowledge base (the GitHub Codespaces demo case).
+                artifacts_loaded, tainted = _try_load_production_artifacts(instance)
+                if tainted:
+                    # A failed load can leave the engine half-swapped (new category map, old embeddings),
+                    # so start over from a clean instance that still has the default knowledge base.
+                    instance = engine_class()
+                kb_note = ""
                 for loader_name in ("load_knowledge_base", "load_index", "load", "setup"):
+                    if artifacts_loaded:
+                        break  # the artifacts already supplied the knowledge base
                     loader = getattr(instance, loader_name, None)
                     if callable(loader):
                         kwargs, missing = _knowledge_base_kwargs(loader)
                         if missing:
-                            return Backend(
-                                None, "mock",
-                                f"{class_name}.{loader_name} needs {', '.join(missing)}, but no matching file was found "
-                                f"(looked for <name>.json/.pkl/.parquet/.csv in: {', '.join(_kb_dirs())})",
-                            )
+                            kb_note = (f" ({loader_name} needs {', '.join(missing)}; no matching file found in "
+                                       f"{', '.join(_kb_dirs())})")
+                            logger.warning("No knowledge-base files for %s.%s%s. Using the engine's default knowledge base.",
+                                           class_name, loader_name, kb_note)
+                            break
                         loader(**kwargs)
                         break
                 if getattr(instance, "category_embeddings", True) is None:
-                    return Backend(None, "mock", f"{class_name}: knowledge base not loaded (category_embeddings is None)")
+                    return Backend(None, "mock", f"{class_name}: knowledge base not loaded (category_embeddings is None){kb_note}")
                 for method_name in ("suggest", "predict", "suggest_categories", "classify", "infer"):
                     method = getattr(instance, method_name, None)
                     if callable(method):
-                        return Backend(method, "live", f"engine.{class_name}.{method_name} connected", impl=instance)
+                        suffix = " · production artifacts loaded" if artifacts_loaded else ""
+                        return Backend(method, "live", f"engine.{class_name}.{method_name} connected{suffix}", impl=instance)
             except Exception as exc:
                 return Backend(None, "mock", f"engine initialisation failed: {type(exc).__name__}: {exc}")
     return Backend(None, "mock", "engine.py loaded, but no supported prediction entry point was found")
@@ -354,6 +404,30 @@ def _mock_result(image: Image.Image, metadata: dict[str, str], top_k: int) -> di
     return {"suggestions": suggestions, "neighbors": []}
 
 
+def _dag_path(graph: Any, name: str) -> list[str]:
+    """Root-to-category path through the engine's category DAG (first parent, alphabetically, at each step)."""
+    path, seen = [name], {name}
+    while True:
+        parents = sorted(p for p in graph.predecessors(path[0]) if p not in seen)
+        if not parents:
+            return path
+        path.insert(0, parents[0])
+        seen.add(parents[0])
+
+
+def _attach_dag_paths(suggestions: list[dict[str, Any]], impl: Any) -> None:
+    """The V1.2 engine does not return hierarchy paths, so read them from its category graph."""
+    graph = getattr(impl, "category_graph", None)
+    if graph is None or not hasattr(graph, "predecessors"):
+        return
+    for item in suggestions:
+        try:
+            if item.get("path") in (None, [item["category"]]) and item["category"] in graph:
+                item["path"] = _dag_path(graph, item["category"])
+        except Exception:  # a missing or odd graph must never break the results
+            continue
+
+
 def _run_prediction(backend: Backend, image: Image.Image, metadata: dict[str, str], top_k: int) -> dict[str, Any]:
     started = time.perf_counter()
     if backend.predictor is None:
@@ -362,6 +436,7 @@ def _run_prediction(backend: Backend, image: Image.Image, metadata: dict[str, st
         raw = _call_predictor(backend.predictor, image, metadata, top_k)
         neighbors = _normalise_neighbors(raw) if isinstance(raw, Mapping) else []
         result = {"suggestions": _normalise_suggestions(raw), "neighbors": neighbors}
+        _attach_dag_paths(result["suggestions"], backend.impl)
     # Rank best-first and respect the slider even if the engine returns more.
     result["suggestions"] = sorted(result["suggestions"], key=lambda s: s["confidence"], reverse=True)[:top_k]
     result["latency"] = time.perf_counter() - started
@@ -445,6 +520,8 @@ def record_feedback(image: Optional[Image.Image], category: str, verdict: str) -
     current query image is held in session state, so nothing accumulates between runs.
     """
     _verdicts()[category] = verdict
+    if image is None:
+        image = st.session_state.get("_img")  # the engine needs the query image to embed it
     backend = load_backend()
     if not backend.can_learn:
         st.toast("Saved locally. Continual learning needs the live engine.", icon="ℹ️")
@@ -535,15 +612,15 @@ def _render_input() -> tuple[Optional[Image.Image], dict[str, str], int]:
 
         title = st.text_input(
             "Image title", placeholder="e.g. South façade of the old town hall", key="metadata_title",
-            help="A short caption. It is text evidence that helps the engine pick more specific categories. Optional.",
+            help="A short caption. The engine compares it with each category name (the META scorer) to favour more specific categories. Optional.",
         )
         description = st.text_area(
             "Description", placeholder="Describe the visible subject, place, or event", height=90, key="metadata_description",
-            help="Longer free text about what the image shows. More detail gives the text evidence more to work with. Optional.",
+            help="Longer free text about what the image shows. It is combined with the title for the META scorer, so more detail gives it more to work with. Optional.",
         )
         geotag = st.text_input(
             "Geotag", placeholder="e.g. 51.0504, 13.7373", key="metadata_geotag",
-            help="Where the photo was taken, as “latitude, longitude”. Gives the engine location context; a valid value also shows a map preview. Optional.",
+            help="Where the photo was taken, as “latitude, longitude”. A valid value shows a map preview. The current engine does not use it for ranking. Optional.",
         )
 
         # Live geotag feedback: confirm valid coordinates on a map, flag typos early.
@@ -554,7 +631,7 @@ def _render_input() -> tuple[Optional[Image.Image], dict[str, str], int]:
                 st.caption(f"📍 {coords[0]:.4f}, {coords[1]:.4f}")
                 st.map(pd.DataFrame({"lat": [coords[0]], "lon": [coords[1]]}), zoom=11, height=140)
             else:
-                st.caption("⚠️ Geotag not recognised. Use “latitude, longitude”, e.g. 51.0504, 13.7373. It will still be sent as text.")
+                st.caption("⚠️ Geotag not recognised. Use “latitude, longitude”, e.g. 51.0504, 13.7373. It is passed along as plain text and is not used for ranking.")
 
         top_k = st.slider(
             "Suggestions to return", min_value=3, max_value=8, value=3, key="top_k",
@@ -651,7 +728,7 @@ def _render_evidence(image: Optional[Image.Image], result: dict[str, Any]) -> No
                 st.info(
                     "🔍 Explainability Panel: The current fundamental engine operates in bounded-cost "
                     "Zero-Shot/Retrieval mode. Nearest-neighbour reference images are omitted to guarantee "
-                    "sub-second latency on cloud CPUs. Trust the multi-scorer breakdown (kNN, Text, Meta) "
+                    "sub-second latency on cloud CPUs. Trust the multi-scorer breakdown (kNN, Text, Meta, Classifier) "
                     "provided in the suggestion cards."
                 )
             else:
@@ -829,13 +906,20 @@ def _page_train(backend: Backend) -> None:
             else:
                 metrics = dict(metrics or {})
                 st.session_state["last_training"] = metrics
-                st.toast("Supervised head updated! The engine will now use the trained classifier for future inferences.", icon="🧠")
+                if int(metrics.get("samples") or 0) > 0:
+                    st.toast("Supervised head updated! The engine will now use the trained classifier for future inferences.", icon="🧠")
+                else:
+                    st.toast("Nothing to train on yet. Accept or reject suggestions in Mode 2 first.", icon="⚠️")
 
     with outcome:
         with st.container(border=True):
             st.subheader("Results")
             last = st.session_state.get("last_training")
-            if last:
+            if last and not int(last.get("samples") or 0):
+                # The engine returns zeros when its feedback buffer is empty; do not present that as a trained head.
+                st.warning("Nothing was trained: the feedback buffer is empty. Accept or reject suggestions in "
+                           "**② Review & Feedback**, then run training again.")
+            elif last:
                 st.success("Supervised head updated! The engine will now use the trained classifier for future inferences.")
                 f1_col, loss_col, samples_col = st.columns(3)
                 f1 = _f1_score(last)
@@ -850,7 +934,7 @@ def _page_train(backend: Backend) -> None:
                 loss_curve = _float_list(last.get("loss_history"))
                 if loss_curve:
                     st.caption("Loss per epoch (it should drop as training progresses)")
-                    st.line_chart(pd.DataFrame({"Loss": loss_curve}, index=pd.RangeIndex(1, len(loss_curve) + 1, name="Epoch")))
+                    st.line_chart(pd.DataFrame({"Asymmetric Loss": loss_curve}, index=range(1, len(loss_curve) + 1)))
                 else:
                     st.caption("The engine did not return a per-epoch loss history for this run.")
             else:
