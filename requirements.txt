@@ -1,0 +1,22 @@
+# Core ML Frameworks
+torch
+transformers
+accelerate
+numpy
+scikit-learn
+torchvision
+ImageHash
+safetensors
+
+# Vector Search & Graph Logic
+faiss-cpu
+networkx
+
+# Data & Image Processing
+pillow
+tqdm
+sentencepiece
+protobuf
+
+# Frontend / UI
+streamlit
