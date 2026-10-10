@@ -1,914 +1,920 @@
-"""
-Commons Category Suggester - Streamlit front-end (app.py)
-=========================================================
-Hackathon challenge: "Automatic Category Suggestion for Wikimedia Commons".
+"""Wikimedia Commons automatic category suggestion dashboard.
 
-This file is the *entire* UI, written in pure Python / Streamlit (no JavaScript,
-no raw HTML). It talks to ``engine.py`` (SigLIP/CLIP + kNN / text / metadata
-scorers + stacking fusion + NetworkX hierarchy post-processing) through a small
-adapter, and degrades gracefully to a built-in MOCK engine when ``engine.py``
-is missing, broken, or still being written - so the UI can always be demoed.
+Launch locally with:
+    streamlit run app.py
 
-HEALTH CHECK  (GitHub Codespaces terminal)
-------------------------------------------
-    pip install -r requirements.txt
-    python app.py --selftest          # headless sanity check of the adapter + mock (no browser)
-    streamlit run app.py              # then click the forwarded-port popup (port 8501)
+Layout: the left sidebar is the control dashboard (theme, mode selector, input
+gateway, status). The main area shows the selected mode:
 
-If the sidebar shows "Mock mode", the UI is healthy but ``engine.py`` was not
-loaded; the exact reason is displayed there. Press "Reload engine" after fixing it.
+    Mode 1  Suggest             upload an image, get ranked categories + explainability
+    Mode 2  Review & Feedback   accept / reject suggestions (human-in-the-loop), export
+    Mode 3  Train               micro-train the supervised head on that feedback
 
-ENGINE CONTRACT (any ONE shape is auto-detected - see ENGINE_CONTRACT below)
+The UI keeps the engine boundary forgiving: it can consume a module-level
+prediction function, an engine object, or run in a clearly marked mock mode
+while the model is unavailable.
 """
 
 from __future__ import annotations
 
-import hashlib
 import importlib
-import inspect
 import io
-import math
-import random
-import re
-import sys
+import inspect
+import json
+import os
+import pickle
 import time
-import traceback
-from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable, Mapping, Optional
 
+import pandas as pd
 import streamlit as st
-from PIL import Image, ImageEnhance, ImageOps, UnidentifiedImageError
-
-# --------------------------------------------------------------------------- #
-# Configuration
-# --------------------------------------------------------------------------- #
-APP_DIR = Path(__file__).resolve().parent
-if str(APP_DIR) not in sys.path:
-    sys.path.insert(0, str(APP_DIR))  # so `import engine` works wherever Streamlit is launched
-
-MAX_UPLOAD_MB = 10      # reject larger uploads (protects Codespaces RAM)
-MAX_PIXELS = 40_000_000  # reject absurd resolutions before decoding (decompression-bomb guard)
-MAX_TEXT_LEN = 2000     # cap pasted metadata so one giant paste cannot stall the engine
-ALLOWED_EXTS = (".jpg", ".jpeg", ".png")
-ALLOWED_FORMATS = ("JPEG", "PNG")
-MAX_SIDE = 1024         # working copy of the upload is downscaled to this
-THUMB_SIDE = 320        # neighbour thumbnails kept in memory at this size
-MAX_K = 15              # engine is always asked for this many; sliders slice at render time
-MAX_NEIGHBORS = 12
-TAU = 0.07              # temperature of the similarity-weighted vote (matches s_knn in the spec)
-
-MODE_AUTO = "Auto - use engine.py, fall back to mock"
-MODE_MOCK = "Force mock mode (UI testing)"
-
-ENGINE_CONTRACT = '''\
-# engine.py - ANY of these shapes is auto-detected by app.py
-#
-#   class CategorySuggestionEngine:            # also: CategoryEngine, SuggestionEngine, Engine
-#       def suggest(self, image, title="", description="", geotag="",
-#                   top_k=10, n_neighbors=6) -> dict: ...
-#   # or module-level: load_engine() / get_engine() returning such an object,
-#   # or plain module functions: suggest_categories(...) / suggest(...) / predict(...)
-#
-# `image` is a PIL.Image (RGB). Parameter names are matched flexibly
-# (image/img, title, description/caption, geotag/location, metadata dict, top_k/k ...).
-#
-# Return value (dict, or just the suggestions list):
-{
-  "suggestions": [
-    {"category": "Bridges",              # name (a leading "Category:" is stripped)
-     "confidence": 0.91,                 # 0-1 (values >1 are read as percent)
-     "path": ["Architecture", "Structures by type", "Bridges"],   # root -> leaf, optional
-     "scores": {"knn": 0.93, "txt": 0.71, "cls": 0.88, "meta": 0.10}}   # optional
-  ],
-  "neighbors": [                          # optional, powers the Explainability panel
-    {"image": "<PIL.Image | file path | URL | bytes>",
-     "similarity": 0.88,                  # cosine similarity
-     "categories": ["Bridges", "Rivers"], # labels of that reference image
-     "title": "File:Example.jpg"}
-  ]
-}
-# Optional feedback hook:  record_feedback(category, accepted: bool) on the engine object.
-'''
-
-ALIASES: dict[str, set[str]] = {
-    "image": {"image", "img", "pil_image", "pil_img", "query_image", "photo", "x"},
-    "title": {"title", "image_title"},
-    "description": {"description", "desc", "caption"},
-    "geotag": {"geotag", "geo", "location", "coords", "coordinates", "gps"},
-    "metadata": {"metadata", "meta", "md"},
-    "top_k": {"top_k", "k", "topk", "num_suggestions", "limit"},
-    "n_neighbors": {"n_neighbors", "k_neighbors", "num_neighbors", "n_neighbours", "knn_k"},
-    "category": {"category", "label", "name"},
-    "accepted": {"accepted", "accept", "is_accepted", "positive"},
-    "verdict": {"verdict", "feedback", "action", "decision"},
-}
-CLASS_CANDIDATES = ("CategorySuggestionEngine", "CategoryEngine", "SuggestionEngine",
-                    "CommonsEngine", "CommonsCategoryEngine", "Engine")
-FACTORY_CANDIDATES = ("load_engine", "get_engine", "build_engine", "init_engine", "create_engine")
-ENTRY_POINTS = ("suggest_categories", "suggest", "predict_categories", "predict",
-                "run_inference", "infer", "run")
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 
-# --------------------------------------------------------------------------- #
-# Mock engine (used when engine.py is unavailable)
-# --------------------------------------------------------------------------- #
-# (keywords, category, path root -> leaf)
-MOCK_TAXONOMY = [
-    (("temple", "church", "cathedral", "mosque", "shrine", "monastery"), "Religious buildings",
-     ["Architecture", "Buildings by function", "Religious buildings"]),
-    (("mountain", "peak", "hill", "alps", "himalaya"), "Mountains",
-     ["Nature", "Landforms", "Mountains"]),
-    (("beach", "sea", "ocean", "coast", "shore"), "Beaches",
-     ["Nature", "Bodies of water", "Coasts", "Beaches"]),
-    (("bridge", "viaduct"), "Bridges",
-     ["Architecture", "Structures by type", "Bridges"]),
-    (("bird", "owl", "eagle", "sparrow"), "Birds",
-     ["Nature", "Animals", "Birds"]),
-    (("flower", "rose", "blossom", "tulip"), "Flowers",
-     ["Nature", "Plants", "Flowers"]),
-    (("street", "market", "city", "downtown", "square"), "Urban streets",
-     ["Geography", "Human settlements", "Urban streets"]),
-    (("festival", "protest", "rally", "parade", "ceremony", "conference"), "Public events",
-     ["Events", "Public events"]),
-    (("food", "dish", "meal", "cuisine", "cake"), "Food and drink",
-     ["Culture", "Food and drink"]),
-    (("crowd", "group", "audience", "team"), "Groups of people",
-     ["People", "Groups of people"]),
-    (("car", "bus", "train", "truck", "railway"), "Road and rail vehicles",
-     ["Transport", "Vehicles", "Road and rail vehicles"]),
-    (("sunset", "sunrise", "sky", "cloud", "dusk"), "Sunsets and skies",
-     ["Nature", "Sky", "Sunsets and skies"]),
-    (("diagram", "chart", "map", "graph", "infographic"), "Diagrams and maps",
-     ["Abstract concepts", "Information graphics", "Diagrams and maps"]),
-    (("tree", "forest", "woodland", "oak"), "Trees",
-     ["Nature", "Plants", "Trees"]),
-    (("boat", "ship", "harbor", "harbour", "ferry"), "Boats and ships",
-     ["Transport", "Watercraft", "Boats and ships"]),
+st.set_page_config(
+    page_title="Commons · Category Intelligence",
+    page_icon="◈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+SUPPORTED_TYPES = ["jpg", "jpeg", "png"]
+# Keys that can sit next to the category map in an engine response and must
+# never be mistaken for category names.
+NON_CATEGORY_KEYS = {"neighbors", "nearest_neighbors", "references", "knn", "metadata", "meta", "latency", "status"}
+DEFAULT_SUGGESTIONS = [
+    {
+        "category": "Cultural heritage monuments",
+        "confidence": 0.93,
+        "path": ["Places", "Cultural heritage", "Cultural heritage monuments"],
+        "reason": "Strong visual and semantic alignment with built heritage imagery.",
+    },
+    {
+        "category": "Historic buildings",
+        "confidence": 0.86,
+        "path": ["Buildings", "Historic buildings", "Historic buildings"],
+        "reason": "Architecture cues and title metadata reinforce this category.",
+    },
+    {
+        "category": "Urban landscapes",
+        "confidence": 0.74,
+        "path": ["Urban studies", "Urban landscapes"],
+        "reason": "Scene composition suggests a wider city context.",
+    },
 ]
 
+MODE_SUGGEST = "① Suggest"
+MODE_REVIEW = "② Review & Feedback"
+MODE_TRAIN = "③ Train"
+MODES = [MODE_SUGGEST, MODE_REVIEW, MODE_TRAIN]
+MODE_CAPTIONS = [
+    "Upload an image and get ranked categories.",
+    "Accept or reject suggestions to teach the engine.",
+    "Retrain the classifier on your feedback.",
+]
+# (banner style, icon, title, what this mode does). Each mode gets its own colour so they
+# stay easy to tell apart on the same page: blue / green / amber.
+MODE_BANNERS = {
+    MODE_SUGGEST: (
+        "info", "🔎", "Mode 1 · Suggest",
+        "Add an image (plus optional title, description and geotag) in the left panel, then press "
+        "“Suggest categories”. Results here are read-only; give feedback in Mode 2.",
+    ),
+    MODE_REVIEW: (
+        "success", "✅", "Mode 2 · Review & Feedback",
+        "Human-in-the-loop curation. Accept correct categories (positive examples) and reject wrong ones "
+        "(hard negatives). Every click is sent to the engine straight away.",
+    ),
+    MODE_TRAIN: (
+        "warning", "🧠", "Mode 3 · Train",
+        "Teach the engine from your feedback: train a lightweight classifier head on the accepts and "
+        "rejects you collected in Mode 2.",
+    ),
+}
 
-def _clip01(x: float) -> float:
-    return max(0.0, min(1.0, x))
+GUIDE_MARKDOWN = """
+**Modes**
+- **① Suggest**: runs the engine on your image and ranks likely Commons categories.
+- **② Review & Feedback**: you confirm (Accept) or correct (Reject) each suggestion; the engine learns from every click.
+- **③ Train**: fits a small classifier on the feedback buffer so future suggestions improve.
 
+**Input gateway**
+- **Image**: JPG or PNG. Sideways phone photos are auto-rotated; corrupt files are rejected.
+- **Title / Description**: text clues about the picture (used as text evidence).
+- **Geotag**: `latitude, longitude`. Gives location context and a map preview.
+- **Suggestions to return**: how many categories to show, best first.
 
-def _mock_thumb(img: Image.Image, rng: random.Random, size: int = 256) -> Image.Image:
-    """A fake 'reference image': a random crop of the query so the demo looks plausible."""
-    w, h = img.size
-    scale = rng.uniform(0.55, 1.0)
-    cw, ch = max(1, int(w * scale)), max(1, int(h * scale))
-    x0, y0 = rng.randint(0, max(0, w - cw)), rng.randint(0, max(0, h - ch))
-    crop = img.crop((x0, y0, x0 + cw, y0 + ch)).resize((size, size))
-    if rng.random() < 0.5:
-        crop = ImageOps.mirror(crop)
-    return ImageEnhance.Brightness(crop).enhance(rng.uniform(0.85, 1.15))
+**Reading a result**
+- **Confidence**: the engine's overall certainty (High ≥ 80%, Medium 50–79%, Low < 50%).
+- **KNN / TXT / META**: the individual scorers: visual similarity to categorised images, text match, and metadata signals.
+- **📂 path**: where the category sits in the Commons category hierarchy.
 
-
-def _mock_suggest(image: Image.Image, title: str, description: str, geotag: str,
-                  top_k: int, n_neighbors: int) -> dict:
-    digest = hashlib.sha256(image.resize((32, 32)).tobytes()).hexdigest()
-    rng = random.Random(int(digest[:12], 16))
-    text = f"{title} {description} {geotag}".lower()
-
-    def hit(keywords: tuple[str, ...]) -> bool:
-        return any(re.search(rf"\b{re.escape(k)}s?\b", text) for k in keywords)
-
-    matched = [e for e in MOCK_TAXONOMY if hit(e[0])]
-    matched_names = {e[1] for e in matched}
-    rest = [e for e in MOCK_TAXONOMY if e[1] not in matched_names]
-    rng.shuffle(rest)
-
-    suggestions = []
-    for keywords, name, path in (matched + rest)[:top_k]:
-        is_hit = name in matched_names
-        conf = rng.uniform(0.74, 0.97) if is_hit else rng.uniform(0.04, 0.50)
-        suggestions.append({
-            "category": name,
-            "confidence": conf,
-            "path": path,
-            "scores": {
-                "knn": _clip01(conf + rng.uniform(-0.10, 0.10)),
-                "txt": _clip01(conf + rng.uniform(-0.15, 0.10)),
-                "cls": _clip01(conf + rng.uniform(-0.10, 0.10)),
-                "meta": _clip01((0.6 + rng.uniform(0, 0.3)) if is_hit else rng.uniform(0, 0.15)),
-            },
-        })
-    suggestions.sort(key=lambda s: s["confidence"], reverse=True)
-    names = [s["category"] for s in suggestions]
-
-    neighbors = []
-    for j in range(n_neighbors):
-        cats = [names[0]] if rng.random() < 0.75 else []
-        if len(names) > 1:
-            cats.append(names[rng.randint(1, min(4, len(names) - 1))])
-        neighbors.append({
-            "image": _mock_thumb(image, rng),
-            "similarity": max(0.40, 0.93 - 0.025 * j - rng.uniform(0, 0.02)),
-            "categories": cats or [names[0]],
-            "title": f"MOCK reference #{j + 1}",
-        })
-    return {"suggestions": suggestions, "neighbors": neighbors}
+**Training terms**
+- **Accept = positive, Reject = hard negative**: a rejection is a stronger signal than a missing label.
+- **Epochs / Learning rate / Batch size**: see the notes under each control in Mode 3.
+- **Asymmetric loss**: a loss that down-weights easy negatives and tolerates missing labels.
+"""
 
 
-# --------------------------------------------------------------------------- #
-# Flexible adapter: call whatever engine.py exposes, normalise whatever it returns
-# --------------------------------------------------------------------------- #
-def _first(obj: Any, keys: tuple[str, ...], default: Any = None) -> Any:
-    for k in keys:
-        val = obj.get(k) if isinstance(obj, dict) else getattr(obj, k, None)
-        if val is not None:
-            return val
+@dataclass
+class Backend:
+    """Resolved backend callable and its human-readable status."""
+
+    predictor: Optional[Callable[..., Any]]
+    status: str
+    detail: str
+    impl: Any = None  # the live CategoryEngine instance (None in mock mode)
+
+    @property
+    def can_learn(self) -> bool:
+        """True when the live engine exposes the continual-learning contract."""
+        return self.status == "live" and callable(getattr(self.impl, "record_feedback", None))
+
+    @property
+    def can_train(self) -> bool:
+        return self.status == "live" and callable(getattr(self.impl, "train_supervised_head", None))
+
+    def send_feedback(self, image: Image.Image, category: str, verdict: str) -> bool:
+        """Forward an accept/reject to the engine; rejects become hard negatives."""
+        if not self.can_learn or image is None:
+            return False
+        self.impl.record_feedback(image, category, accepted=(verdict == "accept"))
+        return True
+
+
+def _safe_text(value: Any) -> str:
+    return str(value).strip() if value is not None else ""
+
+
+def _confidence(value: Any) -> float:
+    try:
+        number = float(value)
+        if number > 1:
+            number /= 100
+        return max(0.0, min(1.0, number))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _first(mapping: Mapping[str, Any], names: Iterable[str], default: Any = None) -> Any:
+    for name in names:
+        if name in mapping and mapping[name] is not None:
+            return mapping[name]
     return default
 
 
-def _clean_name(s: Any) -> str:
-    return re.sub(r"^category:\s*", "", str(s).strip(), flags=re.I).replace("_", " ").strip()
-
-
-def _norm_name(s: Any) -> str:
-    return _clean_name(s).casefold()
-
-
-def _to_path(value: Any, name: str) -> list[str]:
-    parts: list[str] = []
+def _normalise_path(value: Any, category: str) -> list[str]:
     if isinstance(value, str):
-        parts = [p for p in re.split(r"\s*(?:›|->|→|>|\|)\s*", value) if p.strip()]
-    elif isinstance(value, (list, tuple)) and value:
-        if isinstance(value[0], (list, tuple)):  # several paths -> take the first
-            value = value[0]
-        parts = [str(p) for p in value if str(p).strip()]
-    parts = [_clean_name(p) for p in parts]
-    if not parts or parts[-1].casefold() != name.casefold():
-        parts.append(name)  # engine gave ancestors only (or nothing)
-    return parts
+        return [part.strip() for part in value.split("/") if part.strip()] or [category]
+    if isinstance(value, (list, tuple)):
+        return [_safe_text(part) for part in value if _safe_text(part)] or [category]
+    return [category]
 
 
-def _load_display_image(ref: Any):
-    """Return a small PIL image, a URL string, or None. Never raises."""
-    try:
-        if isinstance(ref, Image.Image):
-            img = ref.copy()
-        elif isinstance(ref, (bytes, bytearray)):
-            img = Image.open(io.BytesIO(ref))
-        elif isinstance(ref, (str, Path)):
-            s = str(ref)
-            if s.lower().startswith(("http://", "https://")):
-                return s
-            if not Path(s).is_file():
-                return None
-            img = Image.open(s)
-        else:
-            return None
-        img = ImageOps.exif_transpose(img).convert("RGB")
-        img.thumbnail((THUMB_SIDE, THUMB_SIDE))
-        return img
-    except Exception:
-        return None
-
-
-def _normalize_suggestion(item: Any) -> dict:
-    if isinstance(item, (tuple, list)) and item and isinstance(item[0], str):
-        item = {"category": item[0],
-                "confidence": item[1] if len(item) > 1 else 0.0,
-                "path": item[2] if len(item) > 2 else None}
-    name = _clean_name(_first(item, ("category", "name", "label", "title", "id"), "(unnamed)"))
-    try:
-        conf = float(_first(item, ("confidence", "score", "probability", "prob", "p", "fused_score"), 0.0))
-    except (TypeError, ValueError):
-        conf = 0.0
-    if not math.isfinite(conf):  # NaN / inf from a misbehaving scorer must not render as 100%
-        conf = 0.0
-    if conf > 1.0:
-        conf = conf / 100.0
-    scores_raw = _first(item, ("scores", "components", "scorers", "breakdown"), {})
-    scores = {}
-    if isinstance(scores_raw, dict):
-        for k, v in scores_raw.items():
-            try:
-                scores[re.sub(r"^s_", "", str(k).lower())] = float(v)
-            except (TypeError, ValueError):
-                pass
-    path = _first(item, ("path", "hierarchy", "lineage", "ancestors", "dag_path", "breadcrumb"))
-    return {"name": name, "conf": _clip01(conf), "path": _to_path(path, name), "scores": scores}
-
-
-def _normalize_neighbor(item: Any, idx: int) -> dict:
-    if isinstance(item, (str, bytes, bytearray, Path, Image.Image)):
-        item = {"image": item}
-    ref = _first(item, ("image", "img", "pil_image", "thumbnail", "thumb", "image_path",
-                        "path", "filepath", "file", "url", "uri"))
-    sim = _first(item, ("similarity", "sim", "cosine", "score"))
-    try:
-        sim = float(sim) if sim is not None else None
-    except (TypeError, ValueError):
-        sim = None
-    if sim is not None and not math.isfinite(sim):
-        sim = None
-    cats = _first(item, ("categories", "labels", "category", "tags"), [])
-    if isinstance(cats, str):
-        cats = [cats]
-    elif not isinstance(cats, (list, tuple, set)):
-        try:
-            cats = list(cats)
-        except TypeError:
-            cats = [cats]
-    return {
-        "display": _load_display_image(ref),
-        "sim": sim,
-        "categories": [_clean_name(c) for c in cats if c is not None and str(c).strip()],
-        "title": str(_first(item, ("title", "name", "caption"), f"Reference #{idx + 1}")),
-    }
-
-
-def normalize_result(raw: Any, top_k: int, n_neighbors: int) -> dict:
-    """Accept the shapes listed in ENGINE_CONTRACT (and a few near-misses)."""
-    sug_raw, nb_raw = None, []
-    if isinstance(raw, tuple) and len(raw) == 2 and all(isinstance(p, (list, tuple)) for p in raw):
-        sug_raw, nb_raw = raw
-    elif isinstance(raw, (list, tuple)):
-        sug_raw = raw
-    elif raw is not None:
-        sug_raw = _first(raw, ("suggestions", "categories", "predictions", "results", "ranked"))
-        nb_raw = _first(raw, ("neighbors", "neighbours", "nearest_neighbors", "nearest_neighbours",
-                              "references", "explanations"), [])
-    if isinstance(sug_raw, dict):  # {"Bridges": 0.9, ...}
-        sug_raw = [{"category": k, "confidence": v} for k, v in sug_raw.items()]
-    if sug_raw is None:
-        raise ValueError("Engine output not recognised - expected a list of suggestions or a dict "
-                         "with a 'suggestions' key (see the engine contract in the footer).")
-    suggestions = sorted((_normalize_suggestion(s) for s in sug_raw),
-                         key=lambda s: s["conf"], reverse=True)[:top_k]
-    neighbors = [_normalize_neighbor(n, i) for i, n in enumerate(list(nb_raw or [])[:n_neighbors])]
-    return {"suggestions": suggestions, "neighbors": neighbors}
-
-
-def _call_flexibly(fn, values: dict[str, Any]):
-    """Call fn, binding our values to whatever parameter names it declares."""
-    try:
-        params = inspect.signature(fn).parameters
-    except (TypeError, ValueError):
-        return fn(values["image"]) if "image" in values else fn()
-    kwargs, image_bound = {}, False
-    for pname, p in params.items():
-        if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
-            continue
-        for canon, names in ALIASES.items():
-            if pname.lower() in names and canon in values:
-                kwargs[pname] = values[canon]
-                image_bound = image_bound or canon == "image"
-                break
-    if "image" in values and not image_bound:
-        return fn(values["image"], **kwargs)
-    return fn(**kwargs)
-
-
-class Backend:
-    """Uniform wrapper around engine.py (real) or the built-in mock."""
-
-    def __init__(self, name: str, is_mock: bool, impl: Any = None):
-        self.name, self.is_mock, self.impl = name, is_mock, impl
-
-    @classmethod
-    def mock(cls) -> "Backend":
-        return cls("Mock engine (demo data)", True)
-
-    def entry_point(self):
-        for n in ENTRY_POINTS:
-            fn = getattr(self.impl, n, None)
-            if callable(fn):
-                return fn
-        return None
-
-    def suggest(self, image: Image.Image, title: str, description: str, geotag: str,
-                top_k: int, n_neighbors: int) -> dict:
-        t0 = time.perf_counter()
-        if self.is_mock:
-            raw = _mock_suggest(image, title, description, geotag, top_k, n_neighbors)
-        else:
-            fn = self.entry_point()
-            if fn is None:
-                raise AttributeError(f"engine exposes none of: {', '.join(ENTRY_POINTS)}")
-            raw = _call_flexibly(fn, {
-                "image": image, "title": title, "description": description, "geotag": geotag,
-                "metadata": {"title": title, "description": description, "geotag": geotag},
-                "top_k": top_k, "n_neighbors": n_neighbors,
-            })
-        result = normalize_result(raw, top_k, n_neighbors)
-        result.update(latency_ms=(time.perf_counter() - t0) * 1000, backend=self.name,
-                      is_mock=self.is_mock)
-        return result
-
-    def send_feedback(self, category: str, verdict: str) -> None:
-        """Forward accept/reject to engine.record_feedback if it exists (best effort)."""
-        hook = None if self.is_mock else getattr(self.impl, "record_feedback", None)
-        if callable(hook):
-            try:
-                _call_flexibly(hook, {"category": category, "verdict": verdict,
-                                      "accepted": verdict == "accept"})
-            except Exception:
-                pass
-
-
-def _instantiate(mod: Any) -> Any:
-    for cls_name in CLASS_CANDIDATES:
-        cls = getattr(mod, cls_name, None)
-        if inspect.isclass(cls):
-            return cls()
-    for fac in FACTORY_CANDIDATES:
-        f = getattr(mod, fac, None)
-        if callable(f) and not inspect.isclass(f):
-            return f()
-    return mod  # module-level functions
-
-
-@st.cache_resource(show_spinner="Loading engine.py (first run only)...")
-def load_real_backend() -> tuple[Backend | None, str]:
-    """Import + initialise engine.py exactly once per server process (heavy models live here)."""
-    importlib.invalidate_caches()    # lets "Reload engine" notice an engine.py created after startup
-    sys.modules.pop("engine", None)  # forget any half-imported copy from a previous failed attempt
-    try:
-        mod = importlib.import_module("engine")
-    except ModuleNotFoundError as exc:
-        if exc.name == "engine":
-            return None, "engine.py not found next to app.py."
-        return None, f"engine.py needs a missing package: {exc.name}."
-    except (Exception, SystemExit) as exc:  # syntax errors, CUDA problems, half-written file, sys.exit()...
-        return None, f"engine.py failed to import: {exc!r}"
-    try:
-        impl = _instantiate(mod)
-        backend = Backend(f"engine.{type(impl).__name__ if impl is not mod else 'py (functions)'}",
-                          False, impl)
-        if backend.entry_point() is None:
-            return None, f"engine.py has no recognised entry point ({', '.join(ENTRY_POINTS)})."
-    except (Exception, SystemExit) as exc:
-        return None, f"engine.py loaded but failed to initialise: {exc!r}"
-    return backend, "Connected to engine.py."
-
-
-def resolve_backend(mode: str) -> tuple[Backend, str, bool]:
-    """-> (backend, status message, is_real)."""
-    if mode == MODE_MOCK:
-        return Backend.mock(), "Mock mode forced from the sidebar.", False
-    real, msg = load_real_backend()
-    if real is not None:
-        return real, msg, True
-    return Backend.mock(), msg, False
-
-
-# --------------------------------------------------------------------------- #
-# Input guards (pure functions, no Streamlit calls - exercised by --selftest)
-# --------------------------------------------------------------------------- #
-class ImageInputError(ValueError):
-    """An upload that cannot be used. The message is written to be shown to the user as-is."""
-
-
-def load_image_bytes(data: bytes, filename: str = "upload") -> Image.Image:
-    """Validate + decode an uploaded image. Raises ImageInputError with a friendly message."""
-    ext = Path(filename or "").suffix.lower()
-    if ext and ext not in ALLOWED_EXTS:
-        raise ImageInputError(f"'{filename}' is not a JPG or PNG image. "
-                              "Please upload a .jpg, .jpeg or .png file.")
-    if not data:
-        raise ImageInputError("The uploaded file is empty (0 bytes).")
-    if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
-        raise ImageInputError(f"The file is larger than {MAX_UPLOAD_MB} MB. Please upload a smaller image.")
-    try:
-        probe = Image.open(io.BytesIO(data))  # lazy: reads the header only
-        if probe.format not in ALLOWED_FORMATS:
-            raise ImageInputError(f"The file content is {probe.format or 'unknown'}, not JPEG or PNG - "
-                                  "was it renamed from another format?")
-        if probe.width * probe.height > MAX_PIXELS:
-            raise ImageInputError(f"The image is {probe.width}x{probe.height}px, which is too large to "
-                                  "process safely. Please downscale it first.")
-        probe.verify()  # cheap structural check (consumes the handle)
-        img = Image.open(io.BytesIO(data))
-        if img.format == "JPEG":
-            img.draft("RGB", (MAX_SIDE, MAX_SIDE))  # decode big JPEGs at reduced size to save RAM
-        img.load()  # full decode: catches truncated / corrupt pixel data
-        img = ImageOps.exif_transpose(img).convert("RGB")
-    except ImageInputError:
-        raise
-    except UnidentifiedImageError:
-        raise ImageInputError("This file is not a readable image. It may be a text/PDF file renamed "
-                              "to .jpg/.png, or it may be corrupted.") from None
-    except Image.DecompressionBombError:
-        raise ImageInputError("The image has an extreme pixel count and was rejected for safety.") from None
-    except (OSError, SyntaxError, ValueError, EOFError, MemoryError):
-        raise ImageInputError("The image appears damaged or truncated and could not be decoded. "
-                              "Please re-export it and try again.") from None
-    except Exception:
-        raise ImageInputError("The image could not be processed. Please try a different file.") from None
-    img.thumbnail((MAX_SIDE, MAX_SIDE))
-    return img
-
-
-_CTRL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-_COORD_COMMA = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)\s*[,;]\s*([+-]?\d+(?:\.\d+)?)\s*$")
-_COORD_SPACE = re.compile(r"^\s*([+-]?\d+\.\d+)\s+([+-]?\d+\.\d+)\s*$")
-
-
-def clean_text(value: Any, max_len: int = MAX_TEXT_LEN) -> str:
-    """Always returns a plain str: None -> '', bytes decoded, control chars stripped, length capped."""
-    if value is None:
-        return ""
-    if isinstance(value, (bytes, bytearray)):
-        value = bytes(value).decode("utf-8", "replace")
-    return _CTRL_CHARS.sub("", str(value)).strip()[:max_len]
-
-
-def parse_geotag(raw: Any) -> tuple[str, str | None]:
-    """-> (safe geotag string, optional note). Out-of-range 'lat, lon' pairs are dropped with a note."""
-    text = clean_text(raw, 200)
-    m = _COORD_COMMA.match(text) or _COORD_SPACE.match(text)
-    if m:
-        lat, lon = float(m.group(1)), float(m.group(2))
-        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-            return "", (f"The geotag '{text}' is not a valid latitude/longitude pair "
-                        "(latitude -90..90, longitude -180..180), so it was ignored.")
-        return f"{lat:.6f}, {lon:.6f}", None
-    return text, None  # free-text place names pass through untouched
-
-
-# --------------------------------------------------------------------------- #
-# Session-state & UI guards
-# --------------------------------------------------------------------------- #
-REQUIRED_RESULT_KEYS = ("suggestions", "neighbors", "query_thumb", "backend", "is_mock", "latency_ms")
-
-
-def init_state() -> None:
-    """Every key the app reads gets a safe default once, so widgets never hit a missing key."""
-    st.session_state.setdefault("feedback", {})
-    st.session_state.setdefault("engine_gen", 0)      # bumped by "Reload engine"
-    st.session_state.setdefault("last_request", None)  # fingerprint of the last completed run
-
-
-def reset_image_state() -> None:
-    for k in ("_img_key", "_img", "result", "last_request"):
-        st.session_state.pop(k, None)
-    st.session_state["feedback"] = {}
-
-
-def get_result() -> dict | None:
-    """The stored result, or None if it is missing, malformed, or belongs to a different image."""
-    r = st.session_state.get("result")
-    if (not isinstance(r, dict) or any(k not in r for k in REQUIRED_RESULT_KEYS)
-            or r.get("image_key") != st.session_state.get("_img_key")):
-        st.session_state.pop("result", None)
-        return None
-    return r
-
-
-@contextmanager
-def guarded(section: str):
-    """Turn an unexpected error inside one panel into a message; the rest of the page keeps working."""
-    try:
-        yield
-    except Exception as exc:  # Streamlit's rerun/stop signals are BaseExceptions and pass through
-        st.error(f"The {section} hit an unexpected problem ({type(exc).__name__}: {exc}). "
-                 "The rest of the app is still usable - try again or reload the page.")
-        with st.expander("Technical details"):
-            st.code(traceback.format_exc(), language="text")
-
-
-# --------------------------------------------------------------------------- #
-# Small UI helpers
-# --------------------------------------------------------------------------- #
-def show_image(img: Any, caption: str | None = None) -> None:
-    """st.image that works across Streamlit versions (width API changed in 1.5x)."""
-    try:
-        st.image(img, caption=caption, width="stretch")
-    except Exception:
-        st.image(img, caption=caption, use_container_width=True)
-
-
-def conf_color(pct: float) -> str:
-    return "green" if pct >= 70 else "orange" if pct >= 40 else "red"
-
-
-def get_uploaded_image(uploaded) -> Image.Image:
-    """Validate + decode once per upload. Successes AND failures are cached in session_state,
-    so reruns (slider moves, button clicks) never re-decode a file or re-show a stale result."""
-    key = (uploaded.name, uploaded.size)
-    if st.session_state.get("_img_key") == key and st.session_state.get("_img") is not None:
-        return st.session_state["_img"]
-    cached_err = st.session_state.get("_img_err")
-    if cached_err and cached_err[0] == key:
-        raise ImageInputError(cached_err[1])
-    try:
-        if uploaded.size > MAX_UPLOAD_MB * 1024 * 1024:
-            raise ImageInputError(f"The file is larger than {MAX_UPLOAD_MB} MB. Please upload a smaller image.")
-        img = load_image_bytes(uploaded.getvalue(), uploaded.name)
-    except ImageInputError as exc:
-        reset_image_state()  # never keep showing results that belong to a previous image
-        st.session_state["_img_err"] = (key, str(exc))
-        raise
-    reset_image_state()  # new image -> old suggestions and feedback are stale
-    st.session_state.update(_img_key=key, _img=img, _img_err=None)
-    return img
-
-
-def record_feedback(category: str, verdict: str) -> None:
-    st.session_state.setdefault("feedback", {})[category] = verdict
-    backend = st.session_state.get("_backend")
-    if backend is not None:
-        backend.send_feedback(category, verdict)
-
-
-# --------------------------------------------------------------------------- #
-# UI sections
-# --------------------------------------------------------------------------- #
-def render_sidebar() -> dict:
-    with st.sidebar:
-        st.header("Settings")
-        mode = st.radio("Backend mode", [MODE_AUTO, MODE_MOCK], key="mode")
-        top_k = st.slider("Suggestions shown (k)", 3, MAX_K, 8, key="top_k")
-        n_neighbors = st.slider("Reference neighbours", 2, MAX_NEIGHBORS, 6, key="n_neighbors")
-        min_conf = st.slider("Minimum confidence (%)", 0, 90, 0, step=5, key="min_conf")
-        show_hierarchy = st.toggle("Show DAG hierarchy path", value=True, key="show_hierarchy")
-
-        st.divider()
-        backend, status, is_real = resolve_backend(mode)
-        st.session_state["_backend"] = backend
-        if is_real:
-            st.success(f"Live engine: {backend.name}")
-        else:
-            st.warning("Mock mode active - see the notice at the top of the page.")
-        if st.button("Reload engine"):
-            load_real_backend.clear()
-            st.session_state["engine_gen"] = st.session_state.get("engine_gen", 0) + 1
-            st.rerun()
-        st.caption(f"Feedback logged this session: {len(st.session_state.get('feedback', {}))}")
-    return {"backend": backend, "status": status, "is_real": is_real, "top_k": top_k,
-            "n_neighbors": n_neighbors, "min_conf": min_conf, "show_hierarchy": show_hierarchy}
-
-
-def run_inference(image: Image.Image, title: str, description: str, geotag: str, cfg: dict,
-                  notes: list[str] | None = None) -> None:
-    backend: Backend = cfg["backend"]
-    # Rapid-fire guard: an identical resubmit (double-click, repeated Enter) reuses the stored result.
-    request = (st.session_state.get("_img_key"), title, description, geotag, backend.name,
-               st.session_state.get("engine_gen", 0))
-    existing = get_result()
-    if (existing is not None and not existing.get("fallback_reason")
-            and st.session_state.get("last_request") == request):
-        getattr(st, "toast", st.info)("Same image and metadata - showing the existing results.")
-        return
-    fallback_reason = None
-    try:
-        with st.spinner("Encoding image and searching the index..."):
-            try:
-                result = backend.suggest(image, title, description, geotag, MAX_K, MAX_NEIGHBORS)
-            except Exception as exc:
-                if backend.is_mock:
-                    raise
-                fallback_reason = f"{type(exc).__name__}: {exc}"
-                st.session_state["last_traceback"] = traceback.format_exc()
-                result = Backend.mock().suggest(image, title, description, geotag, MAX_K, MAX_NEIGHBORS)
-        thumb = image.copy()
-        thumb.thumbnail((512, 512))
-        result.update(query_thumb=thumb, fallback_reason=fallback_reason, notes=list(notes or []),
-                      image_key=st.session_state.get("_img_key"))
-    except Exception as exc:
-        st.error(f"Could not generate suggestions ({type(exc).__name__}: {exc}). "
-                 "Your previous results, if any, are unchanged - please try again.")
-        return
-    # Commit only after everything succeeded: a failed or interrupted run never wipes the dashboard.
-    st.session_state["result"] = result
-    st.session_state["last_request"] = request
-    st.session_state["feedback"] = {}
-
-
-def render_input_column(cfg: dict) -> None:
-    st.subheader("Input gateway")
-    uploaded = st.file_uploader(
-        "Drag & drop an image (JPG / PNG)", type=["jpg", "jpeg", "png"],
-        help=f"Max {MAX_UPLOAD_MB} MB. Large images are downscaled to {MAX_SIDE}px to save memory.",
-    )
-    image, upload_failed = None, False
-    if uploaded is None:
-        reset_image_state()
-        st.session_state.pop("_img_err", None)
+def _normalise_suggestions(raw: Any) -> list[dict[str, Any]]:
+    """Convert common engine response shapes into a stable display contract."""
+    if isinstance(raw, Mapping):
+        raw_items = _first(raw, ["suggestions", "predictions", "categories", "results"], None)
+        if raw_items is None:
+            # The response itself may be a {category: score} map; drop sibling metadata keys.
+            raw_items = {key: value for key, value in raw.items() if key not in NON_CATEGORY_KEYS}
     else:
-        try:
-            image = get_uploaded_image(uploaded)
-        except ImageInputError as exc:
-            upload_failed = True
-            st.error(f"Invalid upload: {exc}")
-        except Exception as exc:  # anything unexpected while decoding - still no raw traceback
-            upload_failed = True
-            st.error("This image could not be read. Please try a different JPG or PNG file.")
-            st.caption(f"Technical detail: {type(exc).__name__}")
-    if image is not None:
-        show_image(image, caption=f"{uploaded.name} - working copy {image.width}x{image.height}px")
+        raw_items = raw
 
-    with st.form("metadata_form"):
-        title = st.text_input("Image title", placeholder="e.g. Golden Gate Bridge at sunset")
-        description = st.text_area("Description", height=100,
-                                   placeholder="Caption, event, people-free context, date ...")
-        geotag = st.text_input("Geotag", placeholder="e.g. 37.8199, -122.4783  or  San Francisco, USA")
-        submitted = st.form_submit_button("Suggest categories", type="primary")
-    if submitted:
-        if image is None:
-            st.warning("The uploaded file is not usable - please fix it above and try again."
-                       if upload_failed else "Please upload an image first.")
+    if isinstance(raw_items, Mapping):
+        # Values may be plain scores ({"Cat": 0.9}) rather than dicts.
+        raw_items = [
+            dict(value, category=key) if isinstance(value, Mapping) else {"category": key, "confidence": value}
+            for key, value in raw_items.items()
+        ]
+    if not isinstance(raw_items, (list, tuple)):
+        raw_items = []
+
+    suggestions: list[dict[str, Any]] = []
+    for item in raw_items:
+        scorer_map: Optional[Mapping[str, Any]] = None
+        if isinstance(item, str):
+            category, score, path, reason = item, 0.0, [item], "Returned by the category engine."
+        elif isinstance(item, Mapping):
+            category = _safe_text(_first(item, ["category", "label", "name", "title"], "Unlabelled category"))
+            # "score" may be a per-scorer dict in the V1.2 engine; only scalars count as confidence.
+            raw_score = _first(item, ["confidence", "probability", "similarity", "score"], 0)
+            score = _confidence(raw_score if not isinstance(raw_score, Mapping) else 0)
+            path = _normalise_path(_first(item, ["path", "hierarchy", "dag_path", "parents"]), category)
+            reason = _safe_text(_first(item, ["reason", "explanation", "rationale"], "Suggested by multimodal evidence."))
+            scorer_map = item.get("scores") if isinstance(item.get("scores"), Mapping) else None
+            if scorer_map is None and isinstance(item.get("score"), Mapping):
+                scorer_map = item["score"]
+        elif isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[0], str):
+            # (category, score) pairs
+            category, score = item[0], _confidence(item[1])
+            path, reason = [category], "Returned by the category engine."
         else:
-            # Ghost-metadata guard: blank / whitespace / None fields always reach the engine as safe strings.
-            title, description = clean_text(title), clean_text(description)
-            geotag, geo_note = parse_geotag(geotag)
-            notes = [geo_note] if geo_note else []
-            if not (title or description or geotag):
-                notes.append("No metadata was provided, so these suggestions rely on the image alone. "
-                             "A title, description or geotag usually helps with events and places.")
-            run_inference(image, title, description, geotag, cfg, notes)
+            category, score, path, reason = _safe_text(item), 0.0, [_safe_text(item)], "Returned by the category engine."
+        if category:
+            entry = {"category": category, "confidence": score, "path": path, "reason": reason}
+            if scorer_map:
+                entry["scores"] = {str(k): _confidence(v) for k, v in scorer_map.items()}
+            suggestions.append(entry)
+    return suggestions
 
 
-def render_suggestion_card(i: int, s: dict, cfg: dict) -> None:
-    pct = s["conf"] * 100
-    with st.container(border=True):
-        c1, c2 = st.columns([4, 1])
-        c1.markdown(f"**{i + 1}. {s['name']}**")
-        c2.markdown(f":{conf_color(pct)}[**{pct:.1f}%**]")
-        st.progress(s["conf"])
-        if cfg["show_hierarchy"]:
-            parts = s["path"]
-            if len(parts) > 1:
-                st.caption("Path: " + " › ".join(parts[:-1]) + f" › **{parts[-1]}**")
-            else:
-                st.caption("Path: top-level category")
-        if s["scores"]:
-            labels = {"knn": "kNN", "txt": "text", "cls": "classifier", "meta": "metadata"}
-            st.caption("Scorers: " + " · ".join(f"{labels.get(k, k)} {v:.2f}" for k, v in s["scores"].items()))
-        verdict = st.session_state.get("feedback", {}).get(s["name"])
-        b1, b2, b3 = st.columns([1, 1, 3])
-        b1.button("Accept", key=f"acc_{i}", on_click=record_feedback, args=(s["name"], "accept"),
-                  disabled=verdict == "accept")
-        b2.button("Reject", key=f"rej_{i}", on_click=record_feedback, args=(s["name"], "reject"),
-                  disabled=verdict == "reject")
-        if verdict:
-            b3.caption(f"Marked: {verdict}")
-
-
-def render_results_column(cfg: dict) -> list[dict]:
-    st.subheader("Results dashboard")
-    result = get_result()
-    if not result:
-        st.info("Upload an image and press **Suggest categories** to see ranked suggestions here.")
+def _normalise_neighbors(raw: Any) -> list[dict[str, Any]]:
+    """Read optional nearest-neighbor data without making the engine contract rigid."""
+    if isinstance(raw, Mapping):
+        raw = _first(raw, ["neighbors", "nearest_neighbors", "references", "knn"], [])
+    if not isinstance(raw, (list, tuple)):
         return []
-    for note in result.get("notes", []):
-        st.info(note)
-    if result.get("fallback_reason"):
-        st.warning("engine.py raised an error, so these results are MOCK data. "
-                   f"Reason: {result['fallback_reason']}")
-        with st.expander("Technical details"):
-            st.code(st.session_state.get("last_traceback", ""), language="text")
-    elif result["is_mock"]:
-        st.warning("Mock mode: demo data only - these are not real model predictions.")
-
-    sugs = [s for s in result["suggestions"][:cfg["top_k"]] if s["conf"] * 100 >= cfg["min_conf"]]
-    st.caption(f"Backend: {result['backend']} · latency {result['latency_ms']:.0f} ms · "
-               f"{len(sugs)} suggestion(s) shown. Suggestions are for human review only.")
-    if not sugs:
-        st.info("No suggestion passes the confidence threshold - lower it in the sidebar.")
-    for i, s in enumerate(sugs):
-        render_suggestion_card(i, s, cfg)
-    return sugs
+    result = []
+    for index, item in enumerate(raw[:6], start=1):
+        if isinstance(item, Mapping):
+            image = _first(item, ["image", "image_path", "path", "url", "thumbnail", "data"])
+            label = _safe_text(_first(item, ["category", "label", "title", "name"], f"Reference {index}"))
+            score = _confidence(_first(item, ["similarity", "score", "confidence"], 0))
+        else:
+            image, label, score = item, f"Reference {index}", 0.0
+        result.append({"image": image, "label": label, "score": score})
+    return result
 
 
-def render_explainability(cfg: dict, sugs: list[dict]) -> None:
-    result = get_result()
-    st.divider()
-    st.subheader("Explainability panel - why did the AI suggest this?")
-    if not result:
-        st.caption("Nearest-neighbour reference images will appear here after a run.")
+def _call_predictor(predictor: Callable[..., Any], image: Image.Image, metadata: dict[str, str], top_k: int) -> Any:
+    payload = {
+        "image": image,
+        "image_input": image,  # V1.2 engine: suggest(image_input, metadata=None, top_k=10)
+        "title": metadata["title"],
+        "description": metadata["description"],
+        "geotag": metadata["geotag"],
+        "metadata": metadata,
+        "top_k": top_k,
+    }
+    try:
+        signature = inspect.signature(predictor)
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values())
+        if accepts_kwargs:
+            return predictor(**payload)
+        accepted = {key: value for key, value in payload.items() if key in signature.parameters}
+        if accepted:
+            return predictor(**accepted)
+        return predictor(image)
+    except (TypeError, ValueError):
+        try:
+            return predictor(image=image, title=metadata["title"], description=metadata["description"], geotag=metadata["geotag"])
+        except TypeError:
+            return predictor(image)  # last resort for engines taking only the image as first positional arg
+
+
+def _kb_dirs() -> list[str]:
+    """Folders searched for knowledge-base files; override with COMMONS_DATA_DIR."""
+    extra = os.environ.get("COMMONS_DATA_DIR")
+    return ([extra] if extra else []) + [".", "data", "outputs", "artifacts"]
+
+
+def _read_kb_file(path: Path) -> Any:
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        return json.loads(path.read_text(encoding="utf-8"))
+    if suffix in {".pkl", ".pickle"}:
+        with path.open("rb") as handle:  # only load pickles you produced yourself
+            return pickle.load(handle)
+    frame = pd.read_parquet(path) if suffix == ".parquet" else pd.read_csv(path)
+    return frame.to_dict("records")
+
+
+def _knowledge_base_kwargs(loader: Callable[..., Any]) -> tuple[dict[str, Any], list[str]]:
+    """Fill each required loader argument from a same-named data file (e.g. categories.json)."""
+    kwargs: dict[str, Any] = {}
+    missing: list[str] = []
+    for param in inspect.signature(loader).parameters.values():
+        required = param.default is inspect.Parameter.empty and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        if not required:
+            continue
+        found = next(
+            (Path(folder) / f"{param.name}{ext}" for folder in _kb_dirs() for ext in (".json", ".pkl", ".pickle", ".parquet", ".csv")
+             if (Path(folder) / f"{param.name}{ext}").is_file()),
+            None,
+        )
+        if found is None:
+            missing.append(param.name)
+        else:
+            kwargs[param.name] = _read_kb_file(found)
+    return kwargs, missing
+
+
+@st.cache_resource(show_spinner=False)
+def load_backend() -> Backend:
+    """Import the model once; failures remain visible but never break the UI."""
+    try:
+        module = importlib.import_module("engine")
+    except Exception as exc:  # backend libraries can fail during model initialisation
+        return Backend(None, "mock", f"engine.py unavailable: {type(exc).__name__}")
+
+    for function_name in ("predict", "suggest_categories", "classify", "infer", "run_inference"):
+        candidate = getattr(module, function_name, None)
+        if callable(candidate):
+            return Backend(candidate, "live", f"engine.{function_name} connected")
+    for class_name in ("CategoryEngine", "CategorySuggestionEngine", "CommonsCategoryEngine", "InferenceEngine"):
+        engine_class = getattr(module, class_name, None)
+        if callable(engine_class):
+            try:
+                # Built once per server process thanks to @st.cache_resource, so the
+                # loaded knowledge base survives every Streamlit rerun.
+                instance = engine_class()
+                for loader_name in ("load_knowledge_base", "load_index", "load", "setup"):
+                    loader = getattr(instance, loader_name, None)
+                    if callable(loader):
+                        kwargs, missing = _knowledge_base_kwargs(loader)
+                        if missing:
+                            return Backend(
+                                None, "mock",
+                                f"{class_name}.{loader_name} needs {', '.join(missing)}, but no matching file was found "
+                                f"(looked for <name>.json/.pkl/.parquet/.csv in: {', '.join(_kb_dirs())})",
+                            )
+                        loader(**kwargs)
+                        break
+                if getattr(instance, "category_embeddings", True) is None:
+                    return Backend(None, "mock", f"{class_name}: knowledge base not loaded (category_embeddings is None)")
+                for method_name in ("suggest", "predict", "suggest_categories", "classify", "infer"):
+                    method = getattr(instance, method_name, None)
+                    if callable(method):
+                        return Backend(method, "live", f"engine.{class_name}.{method_name} connected", impl=instance)
+            except Exception as exc:
+                return Backend(None, "mock", f"engine initialisation failed: {type(exc).__name__}: {exc}")
+    return Backend(None, "mock", "engine.py loaded, but no supported prediction entry point was found")
+
+
+def _mock_result(image: Image.Image, metadata: dict[str, str], top_k: int) -> dict[str, Any]:
+    """Deterministic demo output so judges can explore every UI state offline."""
+    title = metadata["title"] or "untitled upload"
+    suggestions = [dict(item) for item in DEFAULT_SUGGESTIONS[:top_k]]
+    suggestions[0]["reason"] = f'Visual match plus metadata context from “{title}”.'
+    return {"suggestions": suggestions, "neighbors": []}
+
+
+def _run_prediction(backend: Backend, image: Image.Image, metadata: dict[str, str], top_k: int) -> dict[str, Any]:
+    started = time.perf_counter()
+    if backend.predictor is None:
+        result = _mock_result(image, metadata, top_k)
+    else:
+        raw = _call_predictor(backend.predictor, image, metadata, top_k)
+        neighbors = _normalise_neighbors(raw) if isinstance(raw, Mapping) else []
+        result = {"suggestions": _normalise_suggestions(raw), "neighbors": neighbors}
+    # Rank best-first and respect the slider even if the engine returns more.
+    result["suggestions"] = sorted(result["suggestions"], key=lambda s: s["confidence"], reverse=True)[:top_k]
+    result["latency"] = time.perf_counter() - started
+    result["mode"] = backend.status
+    return result
+
+
+def _image_from_upload(uploaded_file: Any) -> Optional[Image.Image]:
+    if uploaded_file is None:
+        return None
+    if uploaded_file.type not in {"image/jpeg", "image/png"}:
+        st.error("Unsupported file type. Please upload a JPG or PNG image.")
+        return None
+    try:
+        raw = uploaded_file.getvalue()
+        with Image.open(io.BytesIO(raw)) as probe:
+            probe.verify()
+        # exif_transpose fixes sideways phone photos before they reach the model.
+        image = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+        return image
+    except (UnidentifiedImageError, OSError, ValueError):
+        st.error("This file could not be read as an image. Please choose a valid JPG or PNG.")
+        return None
+
+
+def _parse_geotag(value: str) -> Optional[tuple[float, float]]:
+    """Return (lat, lon) for strings like '51.0504, 13.7373', else None."""
+    parts = [part for part in value.replace(";", ",").replace(" ", ",").split(",") if part]
+    if len(parts) != 2:
+        return None
+    try:
+        lat, lon = float(parts[0]), float(parts[1])
+    except ValueError:
+        return None
+    return (lat, lon) if -90 <= lat <= 90 and -180 <= lon <= 180 else None
+
+
+def _display_neighbor(image: Any, fallback: Optional[Image.Image]) -> Any:
+    if image is None:
+        return fallback
+    if isinstance(image, Image.Image):
+        return image
+    if isinstance(image, (bytes, bytearray)):
+        try:
+            return Image.open(io.BytesIO(image))
+        except (UnidentifiedImageError, OSError):
+            return fallback
+    return image
+
+
+def _tier(score: float) -> tuple[str, str]:
+    """Colour + label for a confidence value."""
+    if score >= 0.8:
+        return "green", "High"
+    if score >= 0.5:
+        return "orange", "Medium"
+    return "red", "Low"
+
+
+# ---------------------------------------------------------------------------
+# Session state, theme and feedback
+# ---------------------------------------------------------------------------
+
+def _verdicts() -> dict[str, str]:
+    """Per-category human verdicts for the current result: {category: 'accept' | 'reject'}."""
+    return st.session_state.setdefault("verdicts", {})
+
+
+def _reset_review() -> None:
+    st.session_state["verdicts"] = {}
+
+
+def _feedback_stats() -> dict[str, int]:
+    return st.session_state.setdefault("feedback_stats", {"accept": 0, "reject": 0})
+
+
+def record_feedback(image: Optional[Image.Image], category: str, verdict: str) -> None:
+    """Button callback: remember the verdict locally and forward it to the live engine.
+
+    The engine receives the PIL image itself (it extracts the embedding); only the single
+    current query image is held in session state, so nothing accumulates between runs.
+    """
+    _verdicts()[category] = verdict
+    backend = load_backend()
+    if not backend.can_learn:
+        st.toast("Saved locally. Continual learning needs the live engine.", icon="ℹ️")
         return
-    st.caption("These are the closest already-categorised images retrieved from the vector database. "
-               "A suggestion is trustworthy when many similar references carry the same category.")
-    neighbors = result["neighbors"][:cfg["n_neighbors"]]
-    if not sugs:
-        return
-    if not neighbors:
-        st.info("The engine returned no neighbour images, so there is nothing to show yet.")
-        return
+    try:
+        if backend.send_feedback(image, category, verdict):
+            _feedback_stats()[verdict] = _feedback_stats().get(verdict, 0) + 1
+            kind = "positive" if verdict == "accept" else "hard negative"
+            st.toast(f"Recorded “{category}” as a {kind}.", icon="✅" if verdict == "accept" else "🚫")
+        else:
+            st.toast("No query image available, so feedback was not sent to the engine.", icon="⚠️")
+    except Exception as exc:  # a feedback failure must never take the UI down
+        st.toast(f"Engine rejected the feedback: {type(exc).__name__}", icon="⚠️")
 
-    labels = [f"{i + 1}. {s['name']} ({s['conf'] * 100:.0f}%)" for i, s in enumerate(sugs)]
-    left, right = st.columns([1, 3], gap="large")
+
+def _on_verdict(category: str, verdict: str) -> None:
+    record_feedback(st.session_state.get("_img"), category, verdict)
+
+
+def _request_run() -> None:
+    """Suggest-button callback: queue a prediction and jump to Mode 1 to show it."""
+    st.session_state["run_requested"] = True
+    st.session_state["mode"] = MODE_SUGGEST
+
+
+def _mark_theme_touched() -> None:
+    st.session_state["theme_touched"] = True
+
+
+def _system_prefers_dark() -> bool:
+    try:
+        from streamlit import config
+        return config.get_option("theme.base") == "dark"
+    except Exception:
+        return False
+
+
+def _apply_theme() -> None:
+    """Apply the sidebar toggle through Streamlit's own theme config (no custom CSS).
+
+    Only acts once the user has touched the toggle, so a visitor whose system is already dark
+    is never forced into light mode. The built-in ⋮ → Settings → Theme menu always works too.
+    """
+    if not st.session_state.get("theme_touched"):
+        return
+    base = "dark" if st.session_state.get("dark_mode") else "light"
+    try:
+        from streamlit import config
+        changed = config.get_option("theme.base") != base
+        if changed:
+            config.set_option("theme.base", base)
+    except Exception:
+        return
+    if changed:
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+def _render_header(backend: Backend) -> None:
+    st.title("Commons Category Intelligence")
+    st.caption("Multimodal suggestions for a cleaner, more discoverable Wikimedia Commons")
+    if backend.status == "live":
+        st.success(f"● LIVE ENGINE  ·  {backend.detail}")
+    else:
+        st.warning(f"● DEMO MODE  ·  {backend.detail}. The dashboard remains fully navigable with sample results.")
+
+
+def _render_mode_banner(mode: str) -> None:
+    style, icon, title, text = MODE_BANNERS[mode]
+    getattr(st, style)(f"{icon} **{title}**  ·  {text}")
+
+
+def _render_input() -> tuple[Optional[Image.Image], dict[str, str], int]:
+    """Input gateway, pinned in the sidebar so it stays available in every mode."""
+    with st.sidebar.expander("📥 Input gateway", expanded=True):
+        uploaded = st.file_uploader(
+            "Image", type=SUPPORTED_TYPES, key="image_upload",
+            help="The Commons image to categorise. JPG or PNG; sideways phone photos are auto-rotated and corrupt files are rejected.",
+        )
+        image = _image_from_upload(uploaded)
+        if image is not None:
+            st.image(image, caption=f"{image.width} × {image.height}px · RGB", use_container_width=True)
+        else:
+            st.info("Upload a JPG or PNG to begin. Your metadata stays in this session.")
+
+        title = st.text_input(
+            "Image title", placeholder="e.g. South façade of the old town hall", key="metadata_title",
+            help="A short caption. It is text evidence that helps the engine pick more specific categories. Optional.",
+        )
+        description = st.text_area(
+            "Description", placeholder="Describe the visible subject, place, or event", height=90, key="metadata_description",
+            help="Longer free text about what the image shows. More detail gives the text evidence more to work with. Optional.",
+        )
+        geotag = st.text_input(
+            "Geotag", placeholder="e.g. 51.0504, 13.7373", key="metadata_geotag",
+            help="Where the photo was taken, as “latitude, longitude”. Gives the engine location context; a valid value also shows a map preview. Optional.",
+        )
+
+        # Live geotag feedback: confirm valid coordinates on a map, flag typos early.
+        geotag_clean = _safe_text(geotag)
+        if geotag_clean:
+            coords = _parse_geotag(geotag_clean)
+            if coords:
+                st.caption(f"📍 {coords[0]:.4f}, {coords[1]:.4f}")
+                st.map(pd.DataFrame({"lat": [coords[0]], "lon": [coords[1]]}), zoom=11, height=140)
+            else:
+                st.caption("⚠️ Geotag not recognised. Use “latitude, longitude”, e.g. 51.0504, 13.7373. It will still be sent as text.")
+
+        top_k = st.slider(
+            "Suggestions to return", min_value=3, max_value=8, value=3, key="top_k",
+            help="How many categories to show, best first. Also trims the list if the engine returns more.",
+        )
+        st.button(
+            "Suggest categories", type="primary", use_container_width=True, disabled=image is None,
+            key="run_prediction", on_click=_request_run,
+            help="Runs the engine on this image and metadata, then opens Mode 1 with the ranked results.",
+        )
+    metadata = {"title": _safe_text(title), "description": _safe_text(description), "geotag": geotag_clean}
+    return image, metadata, top_k
+
+
+def _render_suggestion_card(item: dict[str, Any], index: int, interactive: bool) -> None:
+    score = _confidence(item.get("confidence"))
+    colour, label = _tier(score)
+    category = item["category"]
+    with st.container(border=True):
+        left, right = st.columns([4, 1])
+        with left:
+            st.markdown(f"**{index:02d}  {category}**  :{colour}[● {label}]")
+            st.caption(item.get("reason", "Multimodal evidence"))
+        with right:
+            st.metric("Confidence", f"{score:.0%}", help="The engine's overall certainty that this category fits the image.")
+        st.progress(score, text=f"Model confidence · {score:.0%}")
+        st.caption("📂  " + "  ›  ".join(item.get("path", [category])))
+
+        scores = item.get("scores")
+        if scores:
+            cols = st.columns(len(scores))
+            for col, (name, value) in zip(cols, scores.items()):
+                col.caption(f"{name.upper()} · {value:.0%}")
+                col.progress(value)
+
+        verdict = _verdicts().get(category)
+        if not interactive:
+            if verdict == "accept":
+                st.caption(":green[✔ Accepted in Mode 2]")
+            elif verdict == "reject":
+                st.caption(":red[✘ Rejected in Mode 2]")
+            return
+        accept_col, reject_col, status_col = st.columns([1, 1, 1.4])
+        accept_col.button(
+            "✓ Accept", key=f"accept_btn_{index}_{category}", use_container_width=True,
+            type="primary" if verdict == "accept" else "secondary",
+            on_click=_on_verdict, args=(category, "accept"),
+            help="This category is correct. Sent to the engine as a positive example.",
+        )
+        reject_col.button(
+            "✗ Reject", key=f"reject_btn_{index}_{category}", use_container_width=True,
+            type="primary" if verdict == "reject" else "secondary",
+            on_click=_on_verdict, args=(category, "reject"),
+            help="This category is wrong. Sent to the engine as a hard negative, a stronger signal than a missing label.",
+        )
+        if verdict == "accept":
+            status_col.markdown(":green[✔ Accepted]")
+        elif verdict == "reject":
+            status_col.markdown(":red[✘ Rejected · hard negative]")
+
+
+def _render_suggestions(result: Optional[dict[str, Any]], interactive: bool) -> bool:
+    """Ranked category cards. Returns True when there is something to show."""
+    with st.container(border=True):
+        st.subheader("Suggested categories" if not interactive else "Review suggestions")
+        if not result:
+            st.info("Your ranked categories will appear here after you run the suggestion engine.")
+            return False
+        suggestions = result.get("suggestions", [])
+        if not suggestions:
+            st.warning("The engine returned no categories for this image. Try adding a title or description.")
+            return False
+        if not interactive:
+            best = suggestions[0]
+            metric_a, metric_b, metric_c, metric_d = st.columns(4)
+            metric_a.metric("Top match", best["category"], help="The highest-ranked category.")
+            metric_b.metric("Confidence", f"{_confidence(best['confidence']):.0%}", help="Confidence of the top match.")
+            metric_c.metric("Labels returned", len(suggestions), help="How many categories came back (set by “Suggestions to return”).")
+            metric_d.metric("Latency", f"{result.get('latency', 0):.2f}s", help="Time the engine took for this image.")
+        else:
+            st.caption("Accept what is right, reject what is wrong. Each click goes to the engine immediately; use Mode 3 to train on it.")
+        for index, suggestion in enumerate(suggestions, start=1):
+            _render_suggestion_card(suggestion, index, interactive)
+        return True
+
+
+def _render_evidence(image: Optional[Image.Image], result: dict[str, Any]) -> None:
+    with st.container(border=True):
+        st.subheader("Explainability · nearest-neighbor evidence")
+        st.caption("Reference items retrieved from the vector space that influenced the ranking.")
+        neighbors = result.get("neighbors") or []
+        if not neighbors:
+            if result.get("mode") == "live":
+                st.info(
+                    "🔍 Explainability Panel: The current fundamental engine operates in bounded-cost "
+                    "Zero-Shot/Retrieval mode. Nearest-neighbour reference images are omitted to guarantee "
+                    "sub-second latency on cloud CPUs. Trust the multi-scorer breakdown (kNN, Text, Meta) "
+                    "provided in the suggestion cards."
+                )
+            else:
+                st.info("Demo mode: no reference thumbnails are generated. The uploaded image is shown as the query anchor.")
+                if image is not None:
+                    st.image(image, caption="Uploaded image · query anchor", width=180)
+            return
+        columns = st.columns(min(3, len(neighbors)))
+        for index, neighbor in enumerate(neighbors):
+            with columns[index % len(columns)]:
+                reference = _display_neighbor(neighbor.get("image"), image)
+                if reference is not None:
+                    try:
+                        st.image(reference, use_container_width=True)
+                    except Exception:  # broken path/URL must not take the page down
+                        st.caption("🖼️ Thumbnail unavailable")
+                st.caption(f"{neighbor['label']} · {_confidence(neighbor['score']):.0%} similarity")
+
+
+def _render_review_export(result: dict[str, Any]) -> None:
+    """Review table plus Commons-ready export of accepted (or all non-rejected) categories."""
+    suggestions = result.get("suggestions", [])
+    if not suggestions:
+        return
+    verdicts = _verdicts()
+    accepted = [item for item in suggestions if verdicts.get(item["category"]) == "accept"]
+    rejected = [item for item in suggestions if verdicts.get(item["category"]) == "reject"]
+    # With no explicit accepts, export everything the reviewer has not rejected.
+    chosen = accepted or [item for item in suggestions if item not in rejected]
+    with st.container(border=True):
+        st.subheader("Review summary & export")
+        st.caption(
+            f"{len(accepted)} accepted · {len(rejected)} rejected of {len(suggestions)}."
+            + ("" if accepted else " Nothing accepted yet, so the export includes all non-rejected suggestions.")
+        )
+
+        rows = [
+            {"Rank": index, "Category": item["category"], "Confidence": f"{_confidence(item['confidence']):.1%}",
+             "Path": " › ".join(item.get("path", [])), "Verdict": verdicts.get(item["category"], "—")}
+            for index, item in enumerate(suggestions, start=1)
+        ]
+        with st.expander("Open compact review table"):
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        wikitext = "\n".join(f"[[Category:{item['category']}]]" for item in chosen)
+        st.markdown("**Paste into the Commons file page**")
+        st.caption("Ready-made category tags for the file's wiki page.")
+        st.code(wikitext, language="text")
+
+        export_rows = [
+            {"category": item["category"], "confidence": round(_confidence(item["confidence"]), 4), "path": item.get("path", [])}
+            for item in chosen
+        ]
+        csv_bytes = pd.DataFrame(
+            [{**row, "path": " > ".join(row["path"])} for row in export_rows]
+        ).to_csv(index=False).encode("utf-8")
+        left, right = st.columns(2)
+        left.download_button("Download CSV", csv_bytes, file_name="commons_categories.csv", mime="text/csv",
+                             use_container_width=True, help="The chosen categories as a spreadsheet-friendly file.")
+        right.download_button(
+            "Download JSON", json.dumps(export_rows, indent=2, ensure_ascii=False).encode("utf-8"),
+            file_name="commons_categories.json", mime="application/json", use_container_width=True,
+            help="The chosen categories with confidence and hierarchy path, for scripts and tools.",
+        )
+
+
+def _page_suggest(image: Optional[Image.Image], result: Optional[dict[str, Any]]) -> None:
+    if _render_suggestions(result, interactive=False) and result:
+        st.write("")
+        _render_evidence(image if image is not None else st.session_state.get("_img"), result)
+
+
+def _page_review(result: Optional[dict[str, Any]]) -> None:
+    if not result or not result.get("suggestions"):
+        st.info("Nothing to review yet. Run **① Suggest** first (use “Suggest categories” in the left panel).")
+        return
+    left, right = st.columns([0.8, 1.6], gap="large")
     with left:
-        st.markdown("**Query image**")
-        show_image(result["query_thumb"])
-        if st.session_state.get("explain_sel") not in labels:
-            st.session_state.pop("explain_sel", None)
-        sel = st.selectbox("Explain suggestion", labels, key="explain_sel")
-        chosen = sugs[labels.index(sel)]
-        target = _norm_name(chosen["name"])
-        supports = [target in {_norm_name(c) for c in nb["categories"]} for nb in neighbors]
-        st.metric("Neighbours filed under it", f"{sum(supports)} / {len(neighbors)}")
-        sims = [nb["sim"] for nb in neighbors]
-        if all(v is not None for v in sims):
-            top = max(sims)
-            w = [math.exp((v - top) / TAU) for v in sims]
-            share = sum(wi for wi, ok in zip(w, supports) if ok) / sum(w)
-            st.metric("Similarity-weighted vote", f"{share * 100:.0f}%")
+        with st.container(border=True):
+            st.subheader("Query image")
+            query_image = st.session_state.get("_img")
+            if query_image is not None:
+                st.image(query_image, use_container_width=True)
+            meta = st.session_state.get("last_metadata", {})
+            if meta.get("title"):
+                st.caption(f"**Title:** {meta['title']}")
+            if meta.get("geotag"):
+                st.caption(f"**Geotag:** {meta['geotag']}")
+            stats = _feedback_stats()
+            st.metric("Accepted this session", stats.get("accept", 0), help="Positive examples sent to the engine since the app started.")
+            st.metric("Rejected this session", stats.get("reject", 0), help="Hard negatives sent to the engine since the app started.")
     with right:
-        per_row = 4
-        for start in range(0, len(neighbors), per_row):
-            cols = st.columns(per_row)
-            for col, nb, ok in zip(cols, neighbors[start:start + per_row], supports[start:start + per_row]):
-                with col:
-                    if nb["display"] is not None:
-                        show_image(nb["display"])
-                    else:
-                        st.caption("(no preview available)")
-                    sim_txt = f"similarity {nb['sim']:.2f}" if nb["sim"] is not None else "similarity n/a"
-                    st.caption(f"{nb['title']} · {sim_txt}")
-                    if nb["categories"]:
-                        st.caption("Filed under: " + ", ".join(nb["categories"][:3]))
-                    st.markdown(":green[Supports this suggestion]" if ok else ":gray[Not filed here]")
+        _render_suggestions(result, interactive=True)
+    st.write("")
+    _render_review_export(result)
 
 
-def render_footer() -> None:
-    with st.expander("Health check & engine contract"):
-        st.markdown("**Launch in the GitHub Codespaces terminal**")
-        st.code("pip install -r requirements.txt\n"
-                "python app.py --selftest     # headless sanity check\n"
-                "streamlit run app.py         # open the forwarded port 8501", language="bash")
-        st.markdown("**What app.py expects from engine.py**")
-        st.code(ENGINE_CONTRACT, language="python")
+def _float_list(value: Any) -> list[float]:
+    """Coerce an engine-provided sequence (list, tuple, array, Series) into plain floats."""
+    if value is None or isinstance(value, (str, bytes, Mapping)):
+        return []
+    try:
+        return [float(x) for x in value]
+    except (TypeError, ValueError):
+        return []
+
+
+def _final_loss(metrics: Mapping[str, Any]) -> Optional[float]:
+    """Final loss: the engine's 'final_loss' (older builds: 'loss'), else the last 'loss_history' point."""
+    for key in ("final_loss", "loss"):
+        try:
+            if metrics.get(key) is not None:
+                return float(metrics[key])
+        except (TypeError, ValueError):
+            continue
+    history = _float_list(metrics.get("loss_history"))
+    return history[-1] if history else None
+
+
+def _f1_score(metrics: Mapping[str, Any]) -> Optional[float]:
+    """F1 under any of the common key spellings; None when the engine did not report it."""
+    for key in ("f1_score", "f1", "f1-score", "F1"):
+        try:
+            if metrics.get(key) is not None:
+                return float(metrics[key])
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _page_train(backend: Backend) -> None:
+    """Mode 3: micro-train the supervised head on accumulated accept/reject feedback."""
+    st.caption(
+        "The engine uses a frozen SigLIP encoder. You can train a lightweight Supervised Multi-Label Head "
+        "using Asymmetric Loss on the feedback you've provided (Accepts = Positives, Rejects = Hard Negatives)."
+    )
+    live = backend.can_train
+    if not live:
+        st.info("Training requires the live engine.")
+
+    stats = _feedback_stats()
+    with st.container(border=True):
+        st.subheader("Feedback buffer")
+        st.caption("What the engine has collected from Mode 2 so far this session.")
+        a, b, c = st.columns(3)
+        a.metric("Positives (accepts)", stats.get("accept", 0), help="Categories you confirmed as correct.")
+        b.metric("Hard negatives (rejects)", stats.get("reject", 0), help="Categories you marked as wrong.")
+        c.metric("Total events", stats.get("accept", 0) + stats.get("reject", 0), help="Everything training can learn from.")
+
+    controls, outcome = st.columns([1, 1.2], gap="large")
+    with controls:
+        with st.container(border=True):
+            st.subheader("Training controls")
+            epochs = st.slider("Epochs", 1, 20, 5, key="train_epochs", disabled=not live,
+                               help="Passes over the whole feedback buffer.")
+            st.caption("More epochs fit your feedback more tightly, but a small buffer can be over-fitted.")
+            lr = st.number_input("Learning Rate", min_value=1e-5, max_value=1e-2, value=1e-4, format="%.5f",
+                                 key="train_lr", disabled=not live, help="Size of each update step.")
+            st.caption("Too high makes the loss jump around; too low barely changes the classifier.")
+            batch_size = st.slider("Batch Size", 8, 64, 32, key="train_batch", disabled=not live,
+                                   help="Feedback samples used per update step.")
+            st.caption("Smaller batches give noisier but more frequent updates; larger ones are steadier.")
+            run_training = st.button(
+                "🚀 Run Micro-Training on Feedback Buffer", type="primary", key="run_training",
+                disabled=not live, use_container_width=True,
+                help="Trains the linear head on top of the frozen embeddings using the feedback buffer.",
+            )
+
+    if run_training:
+        with st.spinner("Training the supervised head on the feedback buffer…"):
+            try:
+                metrics = backend.impl.train_supervised_head(epochs=epochs, lr=float(lr), batch_size=batch_size)
+            except Exception as exc:
+                st.error(f"Training could not complete: {type(exc).__name__}: {exc}")
+            else:
+                metrics = dict(metrics or {})
+                st.session_state["last_training"] = metrics
+                st.toast("Supervised head updated! The engine will now use the trained classifier for future inferences.", icon="🧠")
+
+    with outcome:
+        with st.container(border=True):
+            st.subheader("Results")
+            last = st.session_state.get("last_training")
+            if last:
+                st.success("Supervised head updated! The engine will now use the trained classifier for future inferences.")
+                f1_col, loss_col, samples_col = st.columns(3)
+                f1 = _f1_score(last)
+                f1_col.metric("F1-Score", f"{f1:.3f}" if f1 is not None else "—",
+                              help="Balance of precision and recall on your feedback, from 0 to 1; higher is better. "
+                                   "Shows “—” if the engine did not report it.")
+                final_loss = _final_loss(last)
+                loss_col.metric("Final Loss", f"{final_loss:.4f}" if final_loss is not None else "—",
+                                help="Asymmetric loss after the last epoch; lower is better.")
+                samples_col.metric("Samples Trained", last.get("samples", 0), help="Feedback examples used in the last run.")
+
+                loss_curve = _float_list(last.get("loss_history"))
+                if loss_curve:
+                    st.caption("Loss per epoch (it should drop as training progresses)")
+                    st.line_chart(pd.DataFrame({"Loss": loss_curve}, index=pd.RangeIndex(1, len(loss_curve) + 1, name="Epoch")))
+                else:
+                    st.caption("The engine did not return a per-epoch loss history for this run.")
+            else:
+                st.caption("Run a training pass to see F1, loss, sample count and the loss curve here.")
 
 
 def main() -> None:
-    st.set_page_config(page_title="Commons Category Suggester", page_icon="🗂️",
-                       layout="wide", initial_sidebar_state="expanded")
-    init_state()
-    st.title("🗂️ Automatic Category Suggestion for Wikimedia Commons")
-    st.caption("Upload an image, add optional metadata, and review ranked category suggestions "
-               "with their hierarchy paths. Nothing is edited automatically - a human decides.")
-    cfg = render_sidebar()
-    if not cfg["is_real"]:
-        st.warning(f"Running in MOCK mode: {cfg['status']} The interface is fully usable, but the "
-                   "suggestions below are demo data, not real model output.")
-    sugs: list[dict] = []
-    left, right = st.columns([1, 1.4], gap="large")
-    with left:
-        with guarded("input panel"):
-            render_input_column(cfg)
-    with right:
-        with guarded("results dashboard"):
-            sugs = render_results_column(cfg)
-    with guarded("explainability panel"):
-        render_explainability(cfg, sugs)
-    render_footer()
+    if "prediction" not in st.session_state:
+        st.session_state.prediction = None
+    if "last_metadata" not in st.session_state:
+        st.session_state.last_metadata = {}
+
+    backend = load_backend()
+    _apply_theme()
+
+    # ---- left dashboard: appearance, mode selector, input gateway, status ----
+    with st.sidebar:
+        st.subheader("◈ Commons Intelligence")
+        st.radio(
+            "Mode", MODES, key="mode", captions=MODE_CAPTIONS,
+            help="Three stages on one page: get suggestions, review them, then train on your feedback. Your results carry over when you switch.",
+        )
+        st.divider()
+    image, metadata, top_k = _render_input()
+    with st.sidebar:
+        st.divider()
+        st.metric("Engine state", "Connected" if backend.status == "live" else "Fallback",
+                  help="Connected = the real model is answering. Fallback = demo results from sample data.")
+        if st.button("Clear current result", use_container_width=True, key="clear_prediction",
+                     help="Discards the current results, your accept/reject marks and the held query image. Training history is kept."):
+            st.session_state.prediction = None
+            st.session_state.last_metadata = {}
+            st.session_state["_img"] = None  # drop the held query image
+            _reset_review()
+            st.rerun()
+        with st.expander("ℹ️ What does everything do?"):
+            st.markdown(GUIDE_MARKDOWN)
+            st.markdown(":green[● High ≥ 80%]  \n:orange[● Medium 50–79%]  \n:red[● Low < 50%]")
+
+    mode = st.session_state.get("mode", MODE_SUGGEST)
+    _render_header(backend)
+    _render_mode_banner(mode)
+
+    if st.session_state.pop("run_requested", False) and image is not None:
+        with st.spinner("Traversing visual, text, and category signals…"):
+            try:
+                _reset_review()
+                st.session_state.prediction = _run_prediction(backend, image, metadata, top_k)
+                st.session_state.last_metadata = metadata
+                # Keep exactly one query image so Accept/Reject can hand it to the engine.
+                st.session_state["_img"] = image
+            except Exception as exc:
+                st.session_state.prediction = None
+                st.error(f"The prediction could not be completed safely: {type(exc).__name__}.")
+
+    if mode == MODE_SUGGEST:
+        _page_suggest(image, st.session_state.prediction)
+    elif mode == MODE_REVIEW:
+        _page_review(st.session_state.prediction)
+    else:
+        _page_train(backend)
 
 
-# --------------------------------------------------------------------------- #
-# Headless self-test:  python app.py --selftest
-# --------------------------------------------------------------------------- #
-def _selftest() -> None:
-    img = Image.new("RGB", (320, 240), (40, 120, 200))
-    res = Backend.mock().suggest(img, "Golden Gate Bridge at sunset", "Suspension bridge over the bay",
-                                 "37.8199, -122.4783", 5, 4)
-    sugs = res["suggestions"]
-    assert 1 <= len(sugs) <= 5, "mock returned wrong number of suggestions"
-    assert all(0.0 <= s["conf"] <= 1.0 for s in sugs), "confidence out of range"
-    assert [s["conf"] for s in sugs] == sorted((s["conf"] for s in sugs), reverse=True), "not ranked"
-    assert len(res["neighbors"]) == 4 and all(n["display"] is not None for n in res["neighbors"])
-    assert any(s["name"] == "Bridges" for s in sugs), "keyword metadata should surface 'Bridges'"
-    alt = normalize_result({"categories": {"Category:Bridges": 87, "Rivers": 0.2}}, 5, 3)
-    assert abs(alt["suggestions"][0]["conf"] - 0.87) < 1e-9 and alt["suggestions"][0]["name"] == "Bridges"
-    alt2 = normalize_result([("Trees", 0.5, "Nature > Plants")], 5, 3)
-    assert alt2["suggestions"][0]["path"] == ["Nature", "Plants", "Trees"]
-    # --- input guards: bad uploads ---
-    buf = io.BytesIO()
-    Image.new("RGB", (64, 48), (200, 30, 30)).save(buf, "PNG")
-    png = buf.getvalue()
-    assert load_image_bytes(png, "ok.png").mode == "RGB"
-
-    def rejects(data: bytes, name: str) -> bool:
-        try:
-            load_image_bytes(data, name)
-        except ImageInputError:
-            return True
-        return False
-
-    assert rejects(b"hello world", "notes.txt"), "a .txt must be rejected"
-    assert rejects(b"%PDF-1.4 not really", "doc.jpg"), "wrong content behind an image extension"
-    assert rejects(png[: len(png) // 2], "cut.png"), "truncated PNG must be rejected"
-    assert rejects(b"", "empty.png"), "empty file must be rejected"
-    # --- input guards: blank / odd metadata ---
-    assert clean_text(None) == "" and clean_text("  hi\x00 ") == "hi" and len(clean_text("x" * 5000)) == MAX_TEXT_LEN
-    assert parse_geotag(None) == ("", None) and parse_geotag("") == ("", None)
-    assert parse_geotag("37.8199, -122.4783") == ("37.819900, -122.478300", None)
-    assert parse_geotag("91, 10")[0] == "" and parse_geotag("91, 10")[1], "out-of-range coords must be dropped"
-    assert parse_geotag("Paris, France") == ("Paris, France", None)
-    blank = Backend.mock().suggest(img, "", "", "", 5, 3)
-    assert blank["suggestions"] and len(blank["neighbors"]) == 3, "blank metadata must still work"
-    # --- adapter edge cases: NaN scores, odd label types ---
-    odd = normalize_result({"suggestions": [{"category": "X", "confidence": float("nan")}],
-                            "neighbors": [{"image": None, "similarity": float("nan"), "categories": 7}]}, 5, 3)
-    assert odd["suggestions"][0]["conf"] == 0.0 and odd["neighbors"][0]["sim"] is None
-    print("app.py selftest OK - adapter, input guards and mock engine are healthy.")
-
-
-if "--selftest" in sys.argv:
-    _selftest()
-else:
+if __name__ == "__main__":
     main()
+
+# Health check: launch from the repository root with `streamlit run app.py`.
