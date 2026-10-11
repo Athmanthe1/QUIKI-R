@@ -5,6 +5,14 @@ Query-based Image Kategory Inference and Retrieval An intelligent category recom
 Here is the complete, production-grade `README.md` for your project. It is written in a highly professional, "Elite AI Systems Architect" tone, designed to impress hackathon judges by clearly explaining both the high-level architecture and the deep mathematical logic behind your code.
 
 ***
+🚀 **Live Demo:** Experience the project live on [Streamlit Community Cloud](https://quiki-r-mega26.streamlit.app/)!
+
+<div align="center">
+  <a href="https://quiki-r-mega26.streamlit.app/" target="_blank">
+    <img src="https://static.streamlit.io/badges/streamlit_badge_black_white.svg" alt="Streamlit App" height="40">
+  </a>
+</div>
+
 
 # 🗂️ Automatic Category Suggestion for Wikimedia Commons
 
