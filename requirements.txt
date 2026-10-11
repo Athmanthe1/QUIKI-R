@@ -1,22 +1,20 @@
-# Core ML Frameworks
-torch
-transformers
-accelerate
-numpy
-scikit-learn
-torchvision
-ImageHash
-safetensors
+# CPU-only PyTorch wheels (no CUDA download on Streamlit Cloud / Codespaces).
+# NOTE: these are version RANGES, not a lockfile. Generate a lock with
+# `pip-compile` or `uv pip compile` where network access to PyPI is available.
+--extra-index-url https://download.pytorch.org/whl/cpu
 
-# Vector Search & Graph Logic
-faiss-cpu
-networkx
-
-# Data & Image Processing
-pillow
-tqdm
-sentencepiece
-protobuf
-
-# Frontend / UI
-streamlit
+torch>=2.2,<3
+transformers>=4.44,<5
+numpy>=1.26,<3
+pandas>=2.1,<4
+scikit-learn>=1.4,<2
+pyarrow>=15
+safetensors>=0.4
+sentencepiece>=0.2
+protobuf>=4.25
+ImageHash>=4.3
+faiss-cpu>=1.8,<2
+networkx>=3.2,<4
+pillow>=10.2
+tqdm>=4.66
+streamlit>=1.40

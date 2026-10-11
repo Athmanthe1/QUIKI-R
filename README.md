@@ -2,9 +2,6 @@
 Query-based Image Kategory Inference and Retrieval An intelligent category recommendation system for Wikimedia Commons that combines visual similarity, semantic matching, and ranked retrieval to suggest relevant categories for newly uploaded images.
 
 
-Here is the complete, production-grade `README.md` for your project. It is written in a highly professional, "Elite AI Systems Architect" tone, designed to impress hackathon judges by clearly explaining both the high-level architecture and the deep mathematical logic behind your code.
-
-***
 🚀 **Live Demo:** Experience the project live on [Streamlit Community Cloud](https://quiki-r-mega26.streamlit.app/)!
 
 <div align="center">
@@ -20,7 +17,7 @@ Here is the complete, production-grade `README.md` for your project. It is writt
 
 This project implements a scalable, human-in-the-loop category suggestion engine for Wikimedia Commons. It addresses the challenge of extreme multi-label classification over a massive, hierarchical, long-tailed Directed Acyclic Graph (DAG) of categories. 
 
-By combining a frozen Vision-Language Model (SigLIP), Approximate Nearest Neighbour (ANN) retrieval, and a Continual Learning Supervised Head trained with Asymmetric Loss, the system delivers bounded-cost, sub-second inference while dynamically learning from human editor feedback.
+By combining a frozen Vision-Language Model (SigLIP), Approximate Nearest Neighbour (ANN) retrieval, and a Continual Learning Supervised Head trained with Asymmetric Loss, the system delivers bounded-cost inference (latency numbers will be published from `evaluate.py` only) while dynamically learning from human editor feedback.
 
 ---
 
@@ -29,7 +26,7 @@ By combining a frozen Vision-Language Model (SigLIP), Approximate Nearest Neighb
 The project is divided into a modular, 5-stage pipeline:
 
 1. **Data Ingestion & Hygiene (`cleaning_and_split.py`)**: Raw Wikimedia dumps are cleaned, deduplicated, and split temporally to prevent data leakage.
-2. **Scalable Feature Extraction (`extract_embeddings.py`)**: A memory-safe, out-of-core pipeline extracts 512-d SigLIP embeddings for 2GB+ datasets without crashing RAM.
+2. **Scalable Feature Extraction (`extract_embeddings.py`)**: A memory-safe, out-of-core pipeline extracts 768-d SigLIP embeddings for 2GB+ datasets without crashing RAM.
 3. **Offline Supervised Training (`trainer.py`)**: A lightweight linear head is trained on pre-computed embeddings using Asymmetric Loss to handle the extreme long-tail distribution.
 4. **Unified Inference Engine (`engine.py`)**: The core brain. Fuses Zero-Shot, k-NN, Metadata, and Supervised scorers, followed by DAG hierarchy suppression.
 5. **Human-in-the-Loop UI (`app.py`)**: A Streamlit dashboard with 3 modes (Suggest, Review, Train) that captures accept/reject feedback for continual learning.
@@ -51,7 +48,7 @@ The project is divided into a modular, 5-stage pipeline:
 *Designed to process hundreds of thousands of images on commodity hardware.*
 
 - **Out-of-Core Processing**: Streams images in small batches (e.g., 32 at a time) through the frozen SigLIP encoder.
-- **Memory Safety**: Extracts the 512-d embedding, immediately writes it to a `.parquet` file, appends it to a FAISS index, and calls `gc.collect()` to prevent Out-Of-Memory (OOM) crashes on large 2GB+ datasets.
+- **Memory Safety**: Extracts the 768-d embedding, immediately writes it to a `.parquet` file, appends it to a FAISS index, and calls `gc.collect()` to prevent Out-Of-Memory (OOM) crashes on large 2GB+ datasets.
 
 ### 3. `trainer.py` — Offline Supervised Training
 *Trains the multi-label classifier head on the pre-computed embeddings.*
@@ -85,11 +82,11 @@ The project is divided into a modular, 5-stage pipeline:
 
 ---
 
-## 🚀 How It All Fits Together (The LLM/VLM Pipeline)
+## How It All Fits Together
 
-This project is not just a collection of scripts; it is a **Retrieval-Augmented Generation (RAG) system for Images**. 
+The project is a retrieval-plus-classifier pipeline over a frozen vision-language encoder. 
 
-1. **The Encoder (SigLIP)** acts as the "LLM" backbone. It is frozen to ensure bounded-cost inference. It translates pixels and text into a shared 512-dimensional semantic space.
+1. **The Encoder (SigLIP)** is the frozen encoder. It is frozen to ensure bounded-cost inference. It translates pixels and text into a shared 768-dimensional semantic space.
 2. **The Vector Store (FAISS)** acts as the "Memory". It stores millions of image embeddings, allowing the system to perform Approximate Nearest Neighbour (ANN) lookups in milliseconds.
 3. **The Classifier Head (PyTorch)** acts as the "Reasoning" layer. Trained via Asymmetric Loss, it learns the complex, long-tail relationships between visual features and specific Wikimedia categories.
 4. **The UI (Streamlit)** closes the loop. By capturing human feedback, it transforms the system from a static model into a **Continual Learning agent** that improves every time an editor clicks "Accept" or "Reject".
@@ -99,7 +96,7 @@ This project is not just a collection of scripts; it is a **Retrieval-Augmented 
 ## ️ How to Run
 
 ### Option A: GitHub Codespaces (Instant Demo Mode)
-*Perfect for hackathon judges. Uses a built-in 60-category taxonomy.*
+*Perfect for hackathon judges. Uses a small built-in demo taxonomy (50 categories); this is NOT real Commons data.*
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
@@ -128,7 +125,7 @@ streamlit run app.py
 | Criterion | Implementation Evidence |
 | :--- | :--- |
 | **Accuracy (40%)** | Hybrid scoring (k-NN + Zero-Shot + Supervised) with Asymmetric Loss handles the extreme long-tail distribution. |
-| **Efficiency (15%)** | Bounded-cost forward pass. FAISS `IndexFlatIP` ensures sub-millisecond ANN lookups. Chunked extraction prevents OOM. |
+| **Efficiency (15%)** | Bounded-cost forward pass. FAISS retrieval (exact below ~200k vectors, ANN above). No latency claim is made until measured by `evaluate.py`. Chunked extraction prevents OOM. |
 | **Continual Learning (10%)** | `record_feedback()` captures hard negatives. `train_supervised_head()` updates the classifier without retraining the encoder. |
 | **Robustness (10%)** | Temporal/uploader splits prevent leakage. DAG suppression prevents unlabelled-ancestor bias. |
 | **Usability (10%)** | Pure Python Streamlit UI with Explainability Panel and graceful mock fallback. |

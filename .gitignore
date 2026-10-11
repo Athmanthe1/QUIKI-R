@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+# working data and generated outputs (small seed artifacts under artifacts/ ARE tracked)
+data/raw/
+data/images/
+data/work/
+logs/
+*.log
+.DS_Store
+# per-user feedback written at runtime
+feedback/*.jsonl

@@ -3,7 +3,7 @@
 Launch locally with:
     streamlit run app.py
 
-Layout: the left sidebar is the control dashboard (theme, mode selector, input
+Layout: the left sidebar is the control dashboard (mode selector, input
 gateway, status). The main area shows the selected mode:
 
     Mode 1  Suggest             upload an image, get ranked categories + explainability
@@ -497,7 +497,7 @@ def _tier(score: float) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Session state, theme and feedback
+# Session state and feedback
 # ---------------------------------------------------------------------------
 
 def _verdicts() -> dict[str, str]:
@@ -545,38 +545,6 @@ def _request_run() -> None:
     """Suggest-button callback: queue a prediction and jump to Mode 1 to show it."""
     st.session_state["run_requested"] = True
     st.session_state["mode"] = MODE_SUGGEST
-
-
-def _mark_theme_touched() -> None:
-    st.session_state["theme_touched"] = True
-
-
-def _system_prefers_dark() -> bool:
-    try:
-        from streamlit import config
-        return config.get_option("theme.base") == "dark"
-    except Exception:
-        return False
-
-
-def _apply_theme() -> None:
-    """Apply the sidebar toggle through Streamlit's own theme config (no custom CSS).
-
-    Only acts once the user has touched the toggle, so a visitor whose system is already dark
-    is never forced into light mode. The built-in ⋮ → Settings → Theme menu always works too.
-    """
-    if not st.session_state.get("theme_touched"):
-        return
-    base = "dark" if st.session_state.get("dark_mode") else "light"
-    try:
-        from streamlit import config
-        changed = config.get_option("theme.base") != base
-        if changed:
-            config.set_option("theme.base", base)
-    except Exception:
-        return
-    if changed:
-        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -948,7 +916,6 @@ def main() -> None:
         st.session_state.last_metadata = {}
 
     backend = load_backend()
-    _apply_theme()
 
     # ---- left dashboard: appearance, mode selector, input gateway, status ----
     with st.sidebar:
