@@ -11,7 +11,7 @@ import gc
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union
 from datetime import datetime
 
 import numpy as np
@@ -36,32 +36,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger("cleaning_and_split")
 
-# Use lookarounds to allow underscores, hyphens, and spaces as separators.
-# (?<![a-zA-Z0-9]) ensures we don't match partial words (e.g. "xmaintenance")
-# (?![a-zA-Z0-9]) ensures we don't match partial words (e.g. "maintenancex")
-# This perfectly handles Wikimedia's underscore-separated category names!
-_BOUNDARY_START = r"(?<![a-zA-Z0-9])"
-_BOUNDARY_END = r"(?![a-zA-Z0-9])"
-_SEP = r"[\s_-]+"
-
-MAINTENANCE_PATTERNS: List[re.Pattern] = [
-    re.compile(f"{_BOUNDARY_START}maintenance{_BOUNDARY_END}", re.I),
-    re.compile(f"{_BOUNDARY_START}cleanup{_BOUNDARY_END}|{_BOUNDARY_START}clean-up{_BOUNDARY_END}", re.I),
-    re.compile(f"{_BOUNDARY_START}backlog{_BOUNDARY_END}", re.I),
-    re.compile(f"{_BOUNDARY_START}tracking{_SEP}categories{_BOUNDARY_END}", re.I),
-    re.compile(f"{_BOUNDARY_START}hidden{_SEP}categories{_BOUNDARY_END}", re.I),
-    re.compile(f"{_BOUNDARY_START}process{_SEP}categories{_BOUNDARY_END}", re.I),
-    re.compile(f"{_BOUNDARY_START}empty{_SEP}(categories|pages|files|galleries){_BOUNDARY_END}", re.I),
-    re.compile(f"{_BOUNDARY_START}deleted{_SEP}(pages|files|revisions){_BOUNDARY_END}", re.I),
-    re.compile(f"{_BOUNDARY_START}admin(istration)?{_SEP}(categories|pages|noticeboards?){_BOUNDARY_END}", re.I),
-    re.compile(f"files?{_SEP}uploaded{_SEP}with{_BOUNDARY_END}", re.I),
-    re.compile(f"files?{_SEP}with{_SEP}(broken|missing|no){_BOUNDARY_END}", re.I),
-    re.compile(f"{_BOUNDARY_START}license{_SEP}templates?{_BOUNDARY_END}", re.I),
-    re.compile(f"copyright{_SEP}violations?{_BOUNDARY_END}", re.I),
-    re.compile(f"{_BOUNDARY_START}no{_SEP}(license|author|source|description|permission){_BOUNDARY_END}", re.I),
-    re.compile(f"unfree{_SEP}(files?|media){_BOUNDARY_END}", re.I),
-    re.compile(f"{_BOUNDARY_START}speedy{_SEP}deletion{_BOUNDARY_END}", re.I),
-]
+# Process / maintenance category detection.
+#
+# PREFERRED: the dump's hidden-category flag (page_props.hiddencat). When the caller
+# supplies `hidden_categories`, exactly those categories are dropped and the regex below
+# is NOT consulted.
+#
+# FALLBACK (no flag available): a deliberately NARROW set of anchored patterns for
+# well-known Commons process categories. They are anchored to the start of the normalised
+# name so that real content categories such as "Aircraft maintenance" or "Beach cleanup"
+# are kept. Names are normalised first: "Category:" removed, underscores -> spaces,
+# whitespace collapsed, case-folded.
+_PROCESS_FALLBACK_PATTERNS: List[re.Pattern] = [re.compile(p, re.I) for p in (
+    r"^(files? )?uploaded (with|via|by|from) ",                       # Uploaded with UploadWizard / via Campaign:...
+    r"^media (needing|without|lacking|missing|with) ",                # Media needing categories as of ...
+    r"^files? with (no|missing|broken|invalid) ",                     # Files with no machine-readable author
+    r"^files? (needing|lacking|missing) ",
+    r"^(cc[- ]by|cc[- ]zero|cc0|pd[- ]|gfdl|self[- ]published work|attribution)",   # licence-template categories
+    r"^licen[sc]e (review|template|tag)",
+    r"^(possible )?copyright (violations?|status)",
+    r"^(speedy|requests for) deletion",
+    r"^(commons|wikimedia commons) (maintenance|cleanup|backlog)",
+    r"^(maintenance|cleanup|clean-up|backlog)( categories| of| for|$| \d)",
+    r"^(maintenance|cleanup|clean-up|backlog)[ -](maintenance|cleanup|clean-up|backlog|tracking|categories)",
+    r"^(hidden|tracking|process|maintenance) categories$",
+    r"^(empty|deleted) (categories|pages|files|galleries)$",
+    r" as of \d{1,2} \w+ \d{4}$",                                    # dated backlog buckets
+    r" as of \d{4}$",
+    r"^unreviewed ",
+    r"^(files|media|images) (to be|pending) (checked|reviewed|categori[sz]ed)",
+)]
+# Back-compat alias: older code/tests import this name.
+MAINTENANCE_PATTERNS = _PROCESS_FALLBACK_PATTERNS
 
 CONTENT_SAFELIST_PREFIXES: Tuple[str, ...] = ("Commons:", "File:", "Image:")
 DEFAULT_HAMMING_THRESHOLD: int = 8
@@ -105,40 +111,89 @@ def _safe_str(value: Any) -> str:
     except (TypeError, ValueError): pass
     return str(value).strip()
 
-def _is_maintenance_category(category: str) -> bool:
-    if not category: return False
-    bare = category
+def normalize_category_name(category: str) -> str:
+    """Comparison form: no 'Category:' prefix, underscores -> spaces, collapsed whitespace, case-folded."""
+    bare = _safe_str(category)
     for prefix in ("Category:", "category:", "CATEGORY:"):
         if bare.startswith(prefix):
             bare = bare[len(prefix):]
             break
-    bare = bare.strip()
-    if any(bare.startswith(safe) for safe in CONTENT_SAFELIST_PREFIXES):
-        return False
-    return any(pat.search(bare) for pat in MAINTENANCE_PATTERNS)
+    return re.sub(r"\s+", " ", bare.replace("_", " ")).strip().casefold()
 
-def _clean_category_list(categories: Sequence[str], report: CleaningReport) -> List[str]:
+
+def canonical_category_name(category: str) -> str:
+    """Display/ID form used for class lists: no prefix, spaces not underscores, original case kept."""
+    bare = _safe_str(category)
+    for prefix in ("Category:", "category:", "CATEGORY:"):
+        if bare.startswith(prefix):
+            bare = bare[len(prefix):]
+            break
+    return re.sub(r"\s+", " ", bare.replace("_", " ")).strip()
+
+
+def normalize_hidden_set(hidden_categories: Optional[Iterable[str]]) -> Optional[Set[str]]:
+    """Normalise a hidden-category collection once. None means 'no flag information available'."""
+    if hidden_categories is None:
+        return None
+    return {normalize_category_name(c) for c in hidden_categories}
+
+
+def is_process_category(category: str, hidden_categories: Optional[Set[str]] = None) -> bool:
+    """True when `category` encodes process, not content.
+
+    `hidden_categories` must already be normalised (see normalize_hidden_set). If it is not
+    None the dump's flag is authoritative and the regex fallback is skipped.
+    """
+    if not category:
+        return False
+    norm = normalize_category_name(category)
+    if hidden_categories is not None:
+        return norm in hidden_categories
+    raw = _safe_str(category)
+    bare = raw[len("Category:"):] if raw.lower().startswith("category:") else raw
+    if any(bare.strip().startswith(safe) for safe in CONTENT_SAFELIST_PREFIXES):
+        return False
+    return any(pat.search(norm) for pat in _PROCESS_FALLBACK_PATTERNS)
+
+
+def _is_maintenance_category(category: str) -> bool:
+    """Back-compat wrapper (regex fallback only)."""
+    return is_process_category(category, None)
+
+
+def _clean_category_list(categories: Sequence[str], report: CleaningReport,
+                         hidden_categories: Optional[Iterable[str]] = None,
+                         canonicalize: bool = False,
+                         _hidden_normalized: bool = False) -> List[str]:
     if not categories: return []
+    hidden = hidden_categories
+    if hidden is not None and not _hidden_normalized:
+        hidden = normalize_hidden_set(hidden)
     seen, cleaned = set(), []
     for raw in categories:
         cat = _safe_str(raw)
         if not cat: continue
-        if _is_maintenance_category(cat):
+        if is_process_category(cat, hidden):
             report.maintenance_categories_removed += 1
             continue
-        if cat not in seen:
-            seen.add(cat)
-            cleaned.append(cat)
+        out = canonical_category_name(cat) if canonicalize else cat
+        key = normalize_category_name(out) if canonicalize else out
+        if key not in seen:
+            seen.add(key)
+            cleaned.append(out)
     return cleaned
 
 def clean_records(raw_df: pd.DataFrame, report: CleaningReport,
                   category_col: str = "categories", timestamp_col: str = "timestamp",
-                  uploader_col: str = "uploader") -> Tuple[pd.DataFrame, CleaningReport]:
+                  uploader_col: str = "uploader",
+                  hidden_categories: Optional[Iterable[str]] = None,
+                  canonicalize: bool = False) -> Tuple[pd.DataFrame, CleaningReport]:
     if raw_df is None or len(raw_df) == 0:
         return pd.DataFrame(), report
         
     df = raw_df.copy()
     report.total_records += len(df)
+    hidden_norm = normalize_hidden_set(hidden_categories)   # normalise once, not per row
     
     df = df.dropna(subset=[timestamp_col, uploader_col])
     df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce", utc=True)
@@ -162,7 +217,7 @@ def clean_records(raw_df: pd.DataFrame, report: CleaningReport,
             else: cats = [s]
         if not isinstance(cats, (list, tuple, set)):
             return []
-        return _clean_category_list(list(cats), report)
+        return _clean_category_list(list(cats), report, hidden_norm, canonicalize, _hidden_normalized=True)
         
     df[category_col] = df[category_col].map(_clean_row)
     lengths = df[category_col].map(len)
