@@ -102,7 +102,7 @@ def run_training(train_path: str, output_dir: str, epochs: int, batch_size: int,
     category_map = {cat: idx for idx, cat in enumerate(cat_counts.index.tolist())}
     
     # 2. Initialize Head
-    embed_dim = 512 # SigLIP base patch16 224 embed dim
+    embed_dim = 768 # SigLIP base patch16 224 embed dim
     head = WikimediaClassifier(embed_dim, len(category_map)).to(device)
     
     # 3. DataLoader
@@ -162,7 +162,7 @@ def run_test():
         data = {
             'image_path': [f"img_{i}.jpg" for i in range(num_samples)],
             'category': [dummy_cats[i % num_classes] for i in range(num_samples)],
-            'embedding': [np.random.randn(512).astype(np.float32).tolist() for _ in range(num_samples)]
+            'embedding': [np.random.randn(768).astype(np.float32).tolist() for _ in range(num_samples)]
         }
         # Make some embeddings slightly correlated to their category for the loss to drop
         for i in range(num_samples):
