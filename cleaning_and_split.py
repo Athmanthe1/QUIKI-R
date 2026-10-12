@@ -86,6 +86,7 @@ class CleaningReport:
     maintenance_categories_removed: int = 0
     duplicate_hashes_removed: int = 0
     uploader_overlap_resolved: int = 0
+    temporal_dropped: int = 0
 
     def summary(self) -> str:
         lines = [
@@ -96,6 +97,7 @@ class CleaningReport:
             f"  Maintenance cats stripped     : {self.maintenance_categories_removed}",
             f"  Near-duplicate hashes removed : {self.duplicate_hashes_removed}",
             f"  Records reassigned (grouping) : {self.uploader_overlap_resolved}",
+            f"  Dropped (outside split window): {self.temporal_dropped}",
             "=" * 50,
         ]
         return "\n".join(lines)
@@ -354,31 +356,64 @@ def remove_near_duplicates_embeddings(df: pd.DataFrame, emb_col: str = 'embeddin
 def temporal_group_split(df: pd.DataFrame, ratios: Tuple[float, float, float] = DEFAULT_SPLIT_RATIOS,
                          timestamp_col: str = "timestamp", uploader_col: str = "uploader",
                          report: Optional[CleaningReport] = None) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Temporal AND uploader-disjoint split.
+
+    1. Two time cut-offs T1 <= T2 are taken from the timestamp distribution (by row count).
+    2. Each uploader is assigned to exactly ONE split, by the median timestamp of their uploads.
+    3. A row is kept only if its timestamp falls inside its split's window
+       (train: ts <= T1, val: T1 < ts <= T2, test: ts > T2). Rows of an uploader that fall
+       outside the window of the uploader's split are DROPPED (counted in
+       report.temporal_dropped), never moved: moving them would break uploader-disjointness.
+    4. Final guard: val/test rows not strictly newer than the latest train/val row are dropped,
+       so no test image is older than the latest train image.
+    """
     df = df.sort_values(timestamp_col, kind="mergesort").reset_index(drop=True)
     n = len(df)
-    train_end, val_end = int(n * ratios[0]), int(n * (ratios[0] + ratios[1]))
-    
-    uploader_first_ts = df.groupby(uploader_col)[timestamp_col].min().sort_values(kind="mergesort")
-    uploader_counts = df.groupby(uploader_col).size()
-    
-    split_map, cumulative = {}, 0
-    for uploader in uploader_first_ts.index:
-        if cumulative < train_end: split_map[uploader] = "train"
-        elif cumulative < val_end: split_map[uploader] = "val"
-        else: split_map[uploader] = "test"
-        cumulative += int(uploader_counts[uploader])
-        
-    df = df.assign(_split=df[uploader_col].map(split_map))
-    
-    if report:
+    if n == 0:
+        empty = df.copy()
+        return empty, empty.copy(), empty.copy()
+    ts = df[timestamp_col]
+    train_end = min(max(int(n * ratios[0]), 0), n)
+    val_end = min(max(int(n * (ratios[0] + ratios[1])), train_end), n)
+    t1 = ts.iloc[train_end - 1] if train_end > 0 else ts.iloc[0] - pd.Timedelta(days=1)
+    t2 = ts.iloc[val_end - 1] if val_end > 0 else t1
+
+    # uploader -> split by median timestamp (convert to int64 ns for a robust median)
+    ts_ns = ts.astype("int64")
+    med = ts_ns.groupby(df[uploader_col], observed=True).median()
+    # cut-offs taken from the SAME int64 representation (its unit depends on the pandas
+    # version: ns or us), never from Timestamp.value, which is always ns.
+    t1_ns = int(ts_ns.iloc[train_end - 1]) if train_end > 0 else int(ts_ns.iloc[0]) - 1
+    t2_ns = int(ts_ns.iloc[val_end - 1]) if val_end > 0 else t1_ns
+    split_of = pd.Series(np.where(med <= t1_ns, "train", np.where(med <= t2_ns, "val", "test")), index=med.index)
+    assigned = df[uploader_col].map(split_of).astype(object)
+
+    in_window = ((assigned == "train") & (ts <= t1)) | \
+                ((assigned == "val") & (ts > t1) & (ts <= t2)) | \
+                ((assigned == "test") & (ts > t2))
+    df = df.assign(_split=assigned)[in_window].reset_index(drop=True)
+
+    train_df = df[df["_split"] == "train"]
+    val_df = df[df["_split"] == "val"]
+    test_df = df[df["_split"] == "test"]
+    # final guard (also protects against any future change to the window logic)
+    if len(train_df):
+        latest_train = train_df[timestamp_col].max()
+        val_df = val_df[val_df[timestamp_col] > latest_train]
+        test_df = test_df[test_df[timestamp_col] > latest_train]
+    if len(val_df):
+        test_df = test_df[test_df[timestamp_col] > val_df[timestamp_col].max()]
+
+    kept = len(train_df) + len(val_df) + len(test_df)
+    if report is not None:
+        report.temporal_dropped = n - kept
         naive = np.where(np.arange(n) < train_end, "train", np.where(np.arange(n) < val_end, "val", "test"))
-        report.uploader_overlap_resolved = int((df["_split"].to_numpy() != naive).sum())
-        
-    train_df = df[df["_split"] == "train"].drop(columns=["_split"]).reset_index(drop=True)
-    val_df = df[df["_split"] == "val"].drop(columns=["_split"]).reset_index(drop=True)
-    test_df = df[df["_split"] == "test"].drop(columns=["_split"]).reset_index(drop=True)
-    
-    return train_df, val_df, test_df
+        report.uploader_overlap_resolved = int(
+            (df["_split"].to_numpy() != naive[: len(df)]).sum()) if len(df) == n else report.temporal_dropped
+    out = []
+    for part in (train_df, val_df, test_df):
+        out.append(part.drop(columns=["_split"]).reset_index(drop=True))
+    return out[0], out[1], out[2]
 
 # ==============================================================================
 # 8. FULL PIPELINE ORCHESTRATOR
