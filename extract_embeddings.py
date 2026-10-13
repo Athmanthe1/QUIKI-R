@@ -1,7 +1,7 @@
 """
 extract_embeddings.py
 Memory-safe, chunked pipeline to extract SigLIP embeddings for a large local dataset.
-Outputs: dataset_embeddings.parquet, faiss_index.index, faiss_labels.json, category_map.json
+Outputs: dataset_embeddings.parquet, faiss_index.index, index_labels.json, manifest.json
 """
 import os
 import gc
@@ -17,11 +17,13 @@ from PIL import Image
 from transformers import AutoProcessor, AutoModel
 from pathlib import Path
 
+from common import MODEL_NAME, extract_tensor
+from manifest import Manifest, write_manifest
+
 logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
 logger = logging.getLogger("EmbeddingExtractor")
 
 # Configuration
-MODEL_NAME = "google/siglip-base-patch16-224"
 IMAGE_SIZE = 224
 ALLOWED_EXTS = {'.jpg', '.jpeg', '.png'}
 
@@ -88,9 +90,7 @@ def extract_and_save(data_dir: str, output_dir: str, batch_size: int = 16):
         inputs = processor(images=valid_imgs, return_tensors="pt").to(device)
         with torch.no_grad():
             outputs = model.get_image_features(**inputs)
-            # Handle different HF output structures safely
-            emb = outputs.pooler_output if hasattr(outputs, 'pooler_output') else outputs[0]
-            emb = F.normalize(emb, p=2, dim=-1).cpu().numpy().astype('float32')
+            emb = F.normalize(extract_tensor(outputs), p=2, dim=-1).cpu().numpy().astype('float32')
 
         # Store and Index
         all_embeddings.extend(emb)
@@ -125,21 +125,18 @@ def extract_and_save(data_dir: str, output_dir: str, batch_size: int = 16):
     faiss_path = os.path.join(output_dir, "faiss_index.index")
     faiss.write_index(index, faiss_path)
     
-    # Save FAISS Labels (Row index -> List of categories)
-    # Note: In a real multi-label dataset, this would be a list of lists. 
-    # Here we wrap single categories in a list to match engine.py expectations.
-    faiss_labels = [[cat] for cat in all_cats]
-    labels_path = os.path.join(output_dir, "faiss_labels.json")
+    # Class id space: ordered list, list index == class id (single source of truth: manifest.json)
+    classes = sorted(unique_categories)
+    class_to_id = {c: i for i, c in enumerate(classes)}
+    labels_path = os.path.join(output_dir, "index_labels.json")
     with open(labels_path, 'w') as f:
-        json.dump(faiss_labels, f)
-        
-    # Save Category Map (Int ID -> Category Name)
-    sorted_cats = sorted(list(unique_categories))
-    category_map = {i: cat for i, cat in enumerate(sorted_cats)}
-    map_path = os.path.join(output_dir, "category_map.json")
-    with open(map_path, 'w') as f:
-        json.dump(category_map, f)
-        
+        json.dump([[class_to_id[c]] for c in all_cats], f)
+
+    manifest = Manifest(model_name=MODEL_NAME, embed_dim=embed_dim, classes=classes,
+                        index_type="flat", n_vectors=int(index.ntotal))
+    write_manifest(output_dir, manifest, expected_dim=embed_dim)
+    map_path = os.path.join(output_dir, "manifest.json")
+
     logger.info(f"✅ Done! Processed {len(df)} images. Artifacts saved to {output_dir}")
     return parquet_path, faiss_path, labels_path, map_path
 
@@ -175,8 +172,8 @@ def run_test():
         # 3. Verify outputs
         assert os.path.exists(parquet_path), "Parquet file missing!"
         assert os.path.exists(faiss_path), "FAISS index missing!"
-        assert os.path.exists(labels_path), "Labels JSON missing!"
-        assert os.path.exists(map_path), "Category map missing!"
+        assert os.path.exists(labels_path), "Index labels JSON missing!"
+        assert os.path.exists(map_path), "manifest.json missing!"
         
         df = pd.read_parquet(parquet_path)
         assert len(df) == 15, f"Expected 15 rows, got {len(df)}"
@@ -184,9 +181,9 @@ def run_test():
         index = faiss.read_index(faiss_path)
         assert index.ntotal == 15, f"Expected 15 vectors in FAISS, got {index.ntotal}"
         
-        with open(map_path, 'r') as f:
-            cat_map = json.load(f)
-        assert len(cat_map) == 3, f"Expected 3 categories, got {len(cat_map)}"
+        from manifest import read_manifest
+        man = read_manifest(output_dir)
+        assert len(man.classes) == 3, f"Expected 3 categories, got {len(man.classes)}"
         
         logger.info("✅ EMBEDDING EXTRACTION TEST PASSED!")
         

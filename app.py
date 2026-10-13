@@ -307,7 +307,7 @@ def _knowledge_base_kwargs(loader: Callable[..., Any]) -> tuple[dict[str, Any], 
     return kwargs, missing
 
 
-ARTIFACT_FILES = ("faiss_index.index", "supervised_head.pth", "category_map.json", "faiss_labels.json")
+ARTIFACT_FILES = ("manifest.json",)   # the manifest names every other file
 
 
 def _try_load_production_artifacts(impl: Any) -> tuple[bool, bool]:
@@ -328,14 +328,7 @@ def _try_load_production_artifacts(impl: Any) -> tuple[bool, bool]:
         if folder is None:
             raise FileNotFoundError("artifacts/ must contain " + ", ".join(ARTIFACT_FILES))
         called = True
-        # Positional on purpose: V1.2 names these (faiss_path, head_path, category_map_path,
-        # faiss_labels_path), so keyword names would not survive a rename.
-        loader(
-            str(folder / "faiss_index.index"),
-            str(folder / "supervised_head.pth"),
-            str(folder / "category_map.json"),
-            str(folder / "faiss_labels.json"),
-        )
+        loader(str(folder))
         logger.info("Loaded production artifacts from %s", folder)
         return True, False
     except Exception as e:

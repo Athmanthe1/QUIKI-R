@@ -15,38 +15,11 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 
+from common import AsymmetricLoss, WikimediaClassifier, save_head_npz
+from manifest import read_manifest
+
 logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
 logger = logging.getLogger("OfflineTrainer")
-
-# ==============================================================================
-# 1. COMPONENTS (Mirrored exactly from engine.py)
-# ==============================================================================
-class AsymmetricLoss(nn.Module):
-    """Asymmetric Loss for extreme multi-label classification (PDF Section 3)."""
-    def __init__(self, gamma_neg=4.0, gamma_pos=1.0, margin=0.05, eps=1e-8):
-        super().__init__()
-        self.gamma_neg = gamma_neg
-        self.gamma_pos = gamma_pos
-        self.margin = margin
-        self.eps = eps
-
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        probs = torch.sigmoid(logits)
-        pos_weight = (1 - probs) ** self.gamma_pos
-        pos_loss = -targets * pos_weight * torch.log(probs + self.eps)
-        probs_neg = torch.clamp(probs - self.margin, min=0.0)
-        neg_weight = probs_neg ** self.gamma_neg
-        neg_loss = -(1 - targets) * neg_weight * torch.log(1 - probs + self.eps)
-        return (pos_loss + neg_loss).sum(dim=-1).mean()
-
-class WikimediaClassifier(nn.Module):
-    """Lightweight linear head initialized with text prototypes."""
-    def __init__(self, embed_dim: int, num_classes: int):
-        super().__init__()
-        self.fc = nn.Linear(embed_dim, num_classes, bias=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(self.fc(x))
 
 # ==============================================================================
 # 2. DATASET (Reads pre-computed embeddings from Parquet)
@@ -86,122 +59,79 @@ class EmbeddingDataset(Dataset):
 # ==============================================================================
 # 3. MAIN TRAINING LOGIC
 # ==============================================================================
-def run_training(train_path: str, output_dir: str, epochs: int, batch_size: int, lr: float, min_freq: int = 1):
+def run_training(artifacts_dir: str, epochs: int, batch_size: int, lr: float, train_path: str = None):
+    """Train the linear head. The class space comes from artifacts_dir/manifest.json (not recomputed)."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Training on device: {device}")
-    
-    # 1. Scan categories and build label space
-    df_temp = pd.read_parquet(train_path, columns=['category'])
-    cat_counts = df_temp['category'].explode().value_counts()
-    
-    # Filter out extremely rare categories (PDF recommends n_min >= 20 for real data)
-    if min_freq > 1:
-        cat_counts = cat_counts[cat_counts >= min_freq]
-        logger.info(f"Filtered categories with < {min_freq} samples. Remaining: {len(cat_counts)}")
-        
-    category_map = {cat: idx for idx, cat in enumerate(cat_counts.index.tolist())}
-    
-    # 2. Initialize Head
-    embed_dim = 768 # SigLIP base patch16 224 embed dim
-    head = WikimediaClassifier(embed_dim, len(category_map)).to(device)
-    
-    # 3. DataLoader
+    manifest = read_manifest(artifacts_dir)
+    category_map = manifest.class_to_id
+    train_path = train_path or os.path.join(artifacts_dir, manifest.files["embeddings"])
+
+    head = WikimediaClassifier(manifest.embed_dim, len(category_map)).to(device)
     dataset = EmbeddingDataset(train_path, category_map)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0) # num_workers=0 for Windows/Mac safety
-    
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     criterion = AsymmetricLoss(gamma_neg=4.0, gamma_pos=1.0, margin=0.05)
     optimizer = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=1e-4)
-    
-    # 4. Training Loop
+
     head.train()
     loss_history = []
-    
     for epoch in range(epochs):
         epoch_loss = 0.0
-        for step, (embeddings, targets) in enumerate(loader):
-            embeddings = embeddings.to(device)
-            targets = targets.to(device)
-            
+        for embeddings, targets in loader:
+            embeddings, targets = embeddings.to(device), targets.to(device)
             optimizer.zero_grad()
-            logits = head.fc(embeddings) # Raw scores before sigmoid
-            loss = criterion(logits, targets)
-            
+            loss = criterion(head.fc(embeddings), targets)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
-            
-        avg_loss = epoch_loss / len(loader)
-        loss_history.append(avg_loss)
-        logger.info(f"Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.4f}")
-        
-    # 5. Save Artifacts
-    os.makedirs(output_dir, exist_ok=True)
-    head_path = os.path.join(output_dir, "supervised_head.pth")
-    map_path = os.path.join(output_dir, "category_map.json")
-    
-    torch.save(head.state_dict(), head_path)
-    with open(map_path, 'w') as f:
-        json.dump(category_map, f)
-        
-    logger.info(f"✅ Training complete. Artifacts saved to {output_dir}")
+        loss_history.append(epoch_loss / max(len(loader), 1))
+        logger.info(f"Epoch {epoch+1}/{epochs} | Loss: {loss_history[-1]:.4f}")
+
+    W, b = head.to_arrays()
+    head_path = os.path.join(artifacts_dir, manifest.files["head"])
+    save_head_npz(head_path, W, b)          # the manifest already names this file; trainer never rewrites it
+    logger.info(f"Training complete. Head saved to {head_path}")
     return loss_history
 
 # ==============================================================================
 # 4. TEST BLOCK (Generates dummy data and verifies the pipeline)
 # ==============================================================================
 def run_test():
-    logger.info("🧪 STARTING TRAINER TEST...")
+    logger.info("STARTING TRAINER TEST...")
     temp_dir = tempfile.mkdtemp()
-    
     try:
-        # 1. Create dummy parquet
-        num_samples = 100
-        num_classes = 5
-        dummy_cats = ["Category:Beaches", "Category:Mountains", "Category:Cats", "Category:Cars", "Category:Food"]
-        
-        data = {
-            'image_path': [f"img_{i}.jpg" for i in range(num_samples)],
-            'category': [dummy_cats[i % num_classes] for i in range(num_samples)],
-            'embedding': [np.random.randn(768).astype(np.float32).tolist() for _ in range(num_samples)]
-        }
-        # Make some embeddings slightly correlated to their category for the loss to drop
+        from manifest import Manifest, write_manifest
+        num_samples, num_classes = 100, 5
+        classes = ["Beaches", "Mountains", "Cats", "Cars", "Food"]
+        write_manifest(temp_dir, Manifest(model_name="test", embed_dim=768, classes=classes))
+        embs = [np.random.randn(768).astype(np.float32) for _ in range(num_samples)]
         for i in range(num_samples):
-            cat_idx = i % num_classes
-            data['embedding'][i][cat_idx] += 5.0 # Inject signal
-            
-        dummy_df = pd.DataFrame(data)
-        parquet_path = os.path.join(temp_dir, "dummy_embeddings.parquet")
-        dummy_df.to_parquet(parquet_path, index=False)
-        
-        # 2. Run training
-        output_dir = os.path.join(temp_dir, "dummy_output")
-        loss_history = run_training(parquet_path, output_dir, epochs=10, batch_size=16, lr=0.01, min_freq=1)
-        
-        # 3. Verify outputs
-        assert os.path.exists(os.path.join(output_dir, "supervised_head.pth")), "Head weights missing!"
-        assert os.path.exists(os.path.join(output_dir, "category_map.json")), "Category map missing!"
-        
-        # 4. Verify loss dropped
+            embs[i][i % num_classes] += 5.0                       # inject signal so the loss can drop
+        pd.DataFrame({
+            'image_path': [f"img_{i}.jpg" for i in range(num_samples)],
+            'category': [classes[i % num_classes] for i in range(num_samples)],
+            'embedding': [e.tolist() for e in embs],
+        }).to_parquet(os.path.join(temp_dir, "dataset_embeddings.parquet"), index=False)
+
+        loss_history = run_training(temp_dir, epochs=10, batch_size=16, lr=0.01)
+        assert os.path.exists(os.path.join(temp_dir, "supervised_head.npz")), "Head weights missing!"
+        assert not any("map" in f for f in os.listdir(temp_dir)), "no separate id<->name map file may be written"
         assert loss_history[-1] < loss_history[0], f"Loss did not drop! {loss_history[0]} -> {loss_history[-1]}"
-        
         logger.info(f"Loss dropped from {loss_history[0]:.4f} to {loss_history[-1]:.4f}")
-        logger.info("✅ TRAINER TEST PASSED!")
-        
+        logger.info("TRAINER TEST PASSED!")
     finally:
         shutil.rmtree(temp_dir)
-        logger.info("Cleaned up dummy files.")
 
 # ==============================================================================
 # 5. ENTRY POINT
 # ==============================================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Supervised Head on pre-computed embeddings.")
-    parser.add_argument("--train_path", type=str, default="./artifacts/dataset_embeddings.parquet", help="Path to embeddings parquet")
-    parser.add_argument("--output_dir", type=str, default="./artifacts", help="Where to save trained head")
+    parser.add_argument("--artifacts_dir", type=str, default="./artifacts", help="Directory holding manifest.json and the embeddings parquet")
+    parser.add_argument("--train_path", type=str, default=None, help="Override the embeddings parquet (default: from the manifest)")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--min_freq", type=int, default=1, help="Minimum images per category to keep (use 20+ for real data)")
     parser.add_argument("--test", action="store_true", help="Run the dummy data test block")
     
     args = parser.parse_args()
@@ -209,4 +139,4 @@ if __name__ == "__main__":
     if args.test:
         run_test()
     else:
-        run_training(args.train_path, args.output_dir, args.epochs, args.batch_size, args.lr, args.min_freq)
+        run_training(args.artifacts_dir, args.epochs, args.batch_size, args.lr, args.train_path)

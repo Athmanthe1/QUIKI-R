@@ -1,0 +1,90 @@
+"""common.py - code shared by extract_embeddings.py, trainer.py and engine.py.
+
+Single definitions of the model constants, tensor extraction and the supervised head, so the
+stages cannot drift apart. (The manifest contract lives in the torch-free manifest.py and is
+re-exported here for convenience.)
+"""
+from __future__ import annotations
+
+from typing import Any, Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+from manifest import (DEFAULT_FILES, MANIFEST_NAME, SIGLIP_EMBED_DIM, SIGLIP_MODEL_NAME,  # noqa: F401
+                      Manifest, ManifestError, read_manifest, write_manifest)
+
+MODEL_NAME = SIGLIP_MODEL_NAME
+EMBED_DIM = SIGLIP_EMBED_DIM
+
+
+def extract_tensor(output: Any) -> torch.Tensor:
+    """Return a feature tensor from whatever get_*_features returned (tensor or ModelOutput)."""
+    if isinstance(output, torch.Tensor):
+        return output
+    if hasattr(output, "pooler_output") and output.pooler_output is not None:
+        return output.pooler_output
+    if hasattr(output, "last_hidden_state"):
+        return output.last_hidden_state[:, 0, :]
+    try:
+        return output[0]
+    except Exception:
+        raise TypeError(f"Unexpected model output type: {type(output)}")
+
+
+class AsymmetricLoss(nn.Module):
+    """Asymmetric Loss (PDF section 3). Moved here unchanged from engine.py/trainer.py; fixed in the ASL commit."""
+
+    def __init__(self, gamma_neg=4.0, gamma_pos=1.0, margin=0.05, eps=1e-8):
+        super().__init__()
+        self.gamma_neg = gamma_neg
+        self.gamma_pos = gamma_pos
+        self.margin = margin
+        self.eps = eps
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        probs = torch.sigmoid(logits)
+        pos_weight = (1 - probs) ** self.gamma_pos
+        pos_loss = -targets * pos_weight * torch.log(probs + self.eps)
+        probs_neg = torch.clamp(probs - self.margin, min=0.0)
+        neg_weight = probs_neg ** self.gamma_neg
+        neg_loss = -(1 - targets) * neg_weight * torch.log(1 - probs + self.eps)
+        return (pos_loss + neg_loss).sum(dim=-1).mean()
+
+
+class WikimediaClassifier(nn.Module):
+    """Linear head, optionally initialised with text prototypes. ``forward`` returns probabilities."""
+
+    def __init__(self, embed_dim: int, num_classes: int, text_prototypes: Optional[np.ndarray] = None):
+        super().__init__()
+        self.fc = nn.Linear(embed_dim, num_classes, bias=True)
+        if text_prototypes is not None:
+            with torch.no_grad():
+                self.fc.weight.copy_(torch.as_tensor(text_prototypes, dtype=torch.float32))
+                self.fc.bias.zero_()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.fc(x))
+
+    def to_arrays(self):
+        """(W [C, D], b [C]) as float32 numpy arrays, for the torch-free ``.npz`` head format."""
+        return (self.fc.weight.detach().cpu().numpy().astype("float32"),
+                self.fc.bias.detach().cpu().numpy().astype("float32"))
+
+    @classmethod
+    def from_arrays(cls, W: np.ndarray, b: np.ndarray) -> "WikimediaClassifier":
+        head = cls(W.shape[1], W.shape[0])
+        with torch.no_grad():
+            head.fc.weight.copy_(torch.as_tensor(W, dtype=torch.float32))
+            head.fc.bias.copy_(torch.as_tensor(b, dtype=torch.float32))
+        return head
+
+
+def save_head_npz(path, W: np.ndarray, b: np.ndarray) -> None:
+    np.savez(path, W=np.asarray(W, dtype="float32"), b=np.asarray(b, dtype="float32"))
+
+
+def load_head_npz(path):
+    with np.load(path) as z:
+        return z["W"].astype("float32"), z["b"].astype("float32")
