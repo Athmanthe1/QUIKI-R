@@ -22,8 +22,7 @@ import pandas as pd
 # ==============================================================================
 try:
     from PIL import Image
-    from imagehash import phash, hex_to_hash
-    _HASH_AVAILABLE = True
+    _HASH_AVAILABLE = True          # our own pHash only needs PIL + scipy (no imagehash dependency)
 except ImportError:
     _HASH_AVAILABLE = False
 
@@ -72,7 +71,6 @@ MAINTENANCE_PATTERNS = _PROCESS_FALLBACK_PATTERNS
 CONTENT_SAFELIST_PREFIXES: Tuple[str, ...] = ("Commons:", "File:", "Image:")
 DEFAULT_HAMMING_THRESHOLD: int = 8
 DEFAULT_SPLIT_RATIOS: Tuple[float, float, float] = (0.70, 0.15, 0.15)
-PHASH_BRUTE_FORCE_LIMIT: int = 5000
 COSINE_SIM_THRESHOLD: float = 0.95
 
 # ==============================================================================
@@ -85,6 +83,8 @@ class CleaningReport:
     records_without_categories: int = 0
     maintenance_categories_removed: int = 0
     duplicate_hashes_removed: int = 0
+    duplicate_phash_removed: int = 0
+    duplicate_embedding_removed: int = 0
     uploader_overlap_resolved: int = 0
     temporal_dropped: int = 0
 
@@ -95,7 +95,9 @@ class CleaningReport:
             f"  Records with >=1 category     : {self.records_with_categories}",
             f"  Records without any category  : {self.records_without_categories}",
             f"  Maintenance cats stripped     : {self.maintenance_categories_removed}",
-            f"  Near-duplicate hashes removed : {self.duplicate_hashes_removed}",
+            f"  Near-duplicates removed (all) : {self.duplicate_hashes_removed}",
+            f"    by perceptual hash          : {self.duplicate_phash_removed}",
+            f"    by embedding similarity     : {self.duplicate_embedding_removed}",
             f"  Records reassigned (grouping) : {self.uploader_overlap_resolved}",
             f"  Dropped (outside split window): {self.temporal_dropped}",
             "=" * 50,
@@ -252,103 +254,223 @@ def load_raw_records(source: Union[str, Path, pd.DataFrame], chunk_size: int = 1
         raise ValueError(f"Unsupported extension: {suffix}")
 
 # ==============================================================================
-# 6. DEDUPLICATION
+# 6. DEDUPLICATION (dual-mode: pHash BEFORE extraction, embeddings AFTER)
 # ==============================================================================
-def compute_phash(image_path: str) -> Optional[str]:
-    if not _HASH_AVAILABLE or not image_path or not os.path.isfile(image_path): return None
-    try:
-        with Image.open(image_path) as img: return str(phash(img))
-    except Exception: return None
+_POPCOUNT8 = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
 
-def mark_near_duplicates_phash(df: pd.DataFrame, threshold: int = DEFAULT_HAMMING_THRESHOLD) -> pd.DataFrame:
-    df["phash"] = df["image_path"].map(compute_phash)
-    hashed_mask = df["phash"].notna()
-    if not hashed_mask.any():
-        df["is_duplicate"] = False
-        return df
-        
-    hashed_indices = df.index[hashed_mask].tolist()
-    hashed_values = df.loc[hashed_mask, "phash"].tolist()
-    
-    if len(hashed_indices) > PHASH_BRUTE_FORCE_LIMIT:
-        logger.warning("pHash limit exceeded. Subsampling to prevent OOM/hang.")
-        df["is_duplicate"] = df.duplicated(subset=["phash"], keep="first")
-        return df
-        
-    # FIX: Use a dictionary for Union-Find to prevent IndexError on non-contiguous DF indices
-    parent = {idx: idx for idx in hashed_indices}
-    
-    def find(x):
+
+def _popcount64(x: np.ndarray) -> np.ndarray:
+    """Vectorised popcount of a uint64 array (np.bitwise_count on numpy>=2, table fallback otherwise)."""
+    if hasattr(np, "bitwise_count"):
+        return np.bitwise_count(x).astype(np.uint8)
+    b = np.ascontiguousarray(x).view(np.uint8).reshape(*x.shape, 8)
+    return _POPCOUNT8[b].sum(axis=-1).astype(np.uint8)
+
+
+def hamming_hex(a: str, b: str) -> int:
+    return bin(int(a, 16) ^ int(b, 16)).count("1")
+
+
+def compute_phash(image_path: str, hash_size: int = 8, highfreq_factor: int = 4) -> Optional[str]:
+    """64-bit DCT perceptual hash as a 16-char hex string, or None if the file cannot be read.
+
+    Same recipe as the common 'phash': grayscale -> resize to 32x32 -> 2-D DCT -> keep the
+    8x8 low-frequency block -> threshold at its median. Implemented here (numpy + scipy) so the
+    pipeline has no extra dependency and the same code runs in tests and in production.
+    """
+    if not _HASH_AVAILABLE or not image_path or not os.path.isfile(image_path):
+        return None
+    try:
+        from scipy.fft import dctn
+        size = hash_size * highfreq_factor
+        with Image.open(image_path) as img:
+            g = img.convert("L").resize((size, size), Image.LANCZOS)
+        d = dctn(np.asarray(g, dtype=np.float64), type=2, norm="ortho")[:hash_size, :hash_size]
+        bits = (d > np.median(d)).flatten()
+        value = 0
+        for bit in bits:
+            value = (value << 1) | int(bit)
+        return format(value, "0{}x".format(hash_size * hash_size // 4))
+    except Exception as exc:
+        logger.warning("pHash failed for %s: %s", image_path, exc)
+        return None
+
+
+def _hex_to_u64(values: Sequence[Optional[str]]) -> Tuple[np.ndarray, np.ndarray]:
+    """Parse hex hashes into (uint64 array, valid mask). Missing/invalid hashes are invalid, not exact-matched."""
+    arr = np.zeros(len(values), dtype=np.uint64)
+    valid = np.zeros(len(values), dtype=bool)
+    for i, v in enumerate(values):
+        if isinstance(v, str) and v:
+            try:
+                arr[i] = np.uint64(int(v, 16)); valid[i] = True
+            except ValueError:
+                pass
+    return arr, valid
+
+
+def hamming_duplicate_flags(hashes: np.ndarray, threshold: int = DEFAULT_HAMMING_THRESHOLD,
+                            row_block: int = 512) -> np.ndarray:
+    """Flag every hash that is within `threshold` bits of an EARLIER hash (transitively, via union-find).
+
+    Candidate generation uses the pigeonhole principle: split the 64 bits into threshold+1
+    chunks; two hashes within `threshold` bits must be identical in at least one chunk. Only
+    hashes that share a chunk value are compared, with vectorised XOR+popcount, so the cost is
+    far below all-pairs. Exact for any n; no subsampling and no exact-match fallback.
+    """
+    n = len(hashes)
+    hashes = hashes.astype(np.uint64, copy=False)
+    parent = {i: i for i in range(n)}                     # dict-based union-find (as before)
+
+    def find(x: int) -> int:
         while parent[x] != x:
             parent[x] = parent[parent[x]]
             x = parent[x]
         return x
-        
-    def union(a, b):
+
+    def union(a: int, b: int) -> None:                     # smaller index stays root = "first seen" survives
         ra, rb = find(a), find(b)
         if ra != rb:
-            parent[rb] = ra
-            
-    for i in range(len(hashed_indices)):
-        for j in range(i + 1, len(hashed_indices)):
-            try:
-                dist = int(hex_to_hash(hashed_values[i]) - hex_to_hash(hashed_values[j]))
-                if dist <= threshold:
-                    union(hashed_indices[i], hashed_indices[j])
-            except Exception:
-                continue
-                
-    components: Dict[int, List[int]] = {}
-    for idx in hashed_indices:
-        components.setdefault(find(idx), []).append(idx)
-        
-    dup_mask = pd.Series(False, index=df.index)
-    for members in components.values():
-        if len(members) > 1:
-            for dup_idx in members[1:]:
-                dup_mask.loc[dup_idx] = True
-                
-    df["is_duplicate"] = dup_mask
-    return df
+            if ra < rb: parent[rb] = ra
+            else: parent[ra] = rb
 
-def remove_near_duplicates_embeddings(df: pd.DataFrame, emb_col: str = 'embeddings') -> pd.DataFrame:
-    if emb_col not in df.columns or df[emb_col].isna().all():
-        df["is_duplicate"] = False
-        return df
-        
-    # FIX: Process iteratively to prevent OOM crashes from massive np.vstack()
-    keep_mask = np.zeros(len(df), dtype=bool)
-    accepted_list = []
-    
-    for i, val in enumerate(df[emb_col].values):
-        try:
-            emb_raw = np.array(val, dtype=np.float32)
-            if emb_raw.size == 0:
+    n_chunks = max(1, threshold + 1)
+    bounds = np.linspace(0, 64, n_chunks + 1).astype(int)
+    for c in range(n_chunks):
+        lo, hi = int(bounds[c]), int(bounds[c + 1])
+        mask = np.uint64((1 << (hi - lo)) - 1)
+        vals = (hashes >> np.uint64(lo)) & mask
+        order = np.argsort(vals, kind="stable")
+        sv = vals[order]
+        cuts = np.flatnonzero(np.diff(sv)) + 1
+        for grp in np.split(order, cuts):
+            if len(grp) < 2:
                 continue
-                
-            norm = np.linalg.norm(emb_raw)
-            if norm == 0: norm = 1.0
-            emb = emb_raw / norm
-            
-            if not accepted_list:
-                keep_mask[i] = True
-                accepted_list.append(emb)
+            gh = hashes[grp]
+            for s0 in range(0, len(grp), row_block):
+                blk = gh[s0:s0 + row_block]
+                dist = _popcount64(blk[:, None] ^ gh[None, :])
+                ii, jj = np.nonzero(dist <= threshold)
+                for i, j in zip(ii.tolist(), jj.tolist()):
+                    a, b = int(grp[s0 + i]), int(grp[j])
+                    if a != b:
+                        union(a, b)
+    return np.array([find(i) != i for i in range(n)], dtype=bool)
+
+
+def mark_near_duplicates_hashes(df: pd.DataFrame, hash_col: str = "phash",
+                                threshold: int = DEFAULT_HAMMING_THRESHOLD) -> pd.DataFrame:
+    """Add `is_duplicate` from a column of hex hashes. Rows without a hash are never flagged."""
+    arr, valid = _hex_to_u64(df[hash_col].tolist())
+    flags = np.zeros(len(df), dtype=bool)
+    if valid.any():
+        idx = np.flatnonzero(valid)
+        flags[idx] = hamming_duplicate_flags(arr[idx], threshold)
+    out = df.copy()
+    out["is_duplicate"] = flags
+    return out
+
+
+def mark_near_duplicates_phash(df: pd.DataFrame, threshold: int = DEFAULT_HAMMING_THRESHOLD) -> pd.DataFrame:
+    """Compute pHash from `image_path`, then flag near-duplicates (kept for API compatibility)."""
+    out = df.copy()
+    out["phash"] = out["image_path"].map(compute_phash)
+    return mark_near_duplicates_hashes(out, "phash", threshold)
+
+
+def mark_near_duplicates_embeddings(X: np.ndarray, threshold: float = COSINE_SIM_THRESHOLD,
+                                    block_size: int = 1024, acc_chunk: int = 50_000) -> np.ndarray:
+    """Greedy cosine de-duplication with blocked matrix products. Returns a bool array, True = duplicate.
+
+    A row is kept iff its max cosine similarity to every earlier KEPT row is < threshold
+    (identical semantics to the old per-row loop, but one matmul per block). Rows with
+    non-finite values are flagged as duplicates (dropped). Memory is O(block_size * acc_chunk).
+    """
+    X = np.asarray(X, dtype=np.float32)
+    n = len(X)
+    dup = np.zeros(n, dtype=bool)
+    if n == 0:
+        return dup
+    finite = np.isfinite(X).all(axis=1)
+    dup[~finite] = True
+    X = np.where(finite[:, None], X, 0.0)
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    Xn = X / np.where(norms == 0, 1.0, norms)
+    acc = np.empty_like(Xn)
+    n_acc = 0
+    for s0 in range(0, n, block_size):
+        e0 = min(s0 + block_size, n)
+        blk = Xn[s0:e0]
+        cand = finite[s0:e0].copy()
+        if n_acc:
+            best = np.full(len(blk), -np.inf, dtype=np.float32)
+            for a0 in range(0, n_acc, acc_chunk):
+                best = np.maximum(best, (blk @ acc[a0:min(a0 + acc_chunk, n_acc)].T).max(axis=1))
+            cand &= best < threshold
+        G = blk @ blk.T
+        kept_local: List[int] = []
+        for i in np.flatnonzero(cand).tolist():
+            if kept_local and float(G[i, kept_local].max()) >= threshold:
                 continue
-                
-            accepted_matrix = np.array(accepted_list)
-            sims = np.dot(emb, accepted_matrix.T)
-            max_sim = np.max(sims)
-            
-            if max_sim < COSINE_SIM_THRESHOLD:
-                keep_mask[i] = True
-                accepted_list.append(emb)
-            else:
-                keep_mask[i] = False
-        except Exception:
-            keep_mask[i] = False # Drop malformed embeddings safely
-            
-    df["is_duplicate"] = ~keep_mask
-    return df
+            kept_local.append(i)
+        keep = np.zeros(len(blk), dtype=bool)
+        keep[kept_local] = True
+        dup[s0:e0][~keep & finite[s0:e0]] = True
+        if kept_local:
+            acc[n_acc:n_acc + len(kept_local)] = blk[kept_local]
+            n_acc += len(kept_local)
+    return dup
+
+
+def remove_near_duplicates_embeddings(df: pd.DataFrame, emb_col: str = "embeddings") -> pd.DataFrame:
+    """DataFrame wrapper (kept for API compatibility): adds `is_duplicate` from a list-valued column."""
+    out = df.copy()
+    if emb_col not in out.columns or out[emb_col].isna().all():
+        out["is_duplicate"] = False
+        return out
+    ok = out[emb_col].map(lambda v: isinstance(v, (list, tuple, np.ndarray)) and len(v) > 0)
+    flags = np.ones(len(out), dtype=bool)                      # malformed -> dropped, as before
+    if ok.any():
+        mat = np.vstack([np.asarray(v, dtype=np.float32) for v in out.loc[ok, emb_col]])
+        flags[ok.to_numpy()] = mark_near_duplicates_embeddings(mat)
+    out["is_duplicate"] = flags
+    return out
+
+
+def dedup_dataframe(df: pd.DataFrame, hamming_threshold: int = DEFAULT_HAMMING_THRESHOLD,
+                    cosine_threshold: float = COSINE_SIM_THRESHOLD,
+                    timestamp_col: str = "timestamp") -> pd.DataFrame:
+    """Dual-mode dedup (both modes run whenever their input exists).
+
+    1. pHash (needs `image_path` or a `phash` column) - cheap, runs BEFORE embedding extraction.
+    2. Embedding cosine (needs an `embeddings` column) - runs on the pHash survivors, AFTER extraction.
+    Within each mode the earliest upload (by timestamp, else row order) is the copy that survives.
+    Adds dup_phash, dup_embedding and is_duplicate (their OR); the index is preserved.
+    """
+    out = df.copy()
+    out["dup_phash"] = False
+    out["dup_embedding"] = False
+    order = (np.argsort(pd.to_datetime(out[timestamp_col], utc=True).to_numpy(), kind="stable")
+             if timestamp_col in out.columns else np.arange(len(out)))
+
+    if "phash" in out.columns or "image_path" in out.columns:
+        if "phash" not in out.columns:
+            out["phash"] = out["image_path"].map(compute_phash)
+        sub = out.iloc[order]
+        flagged = mark_near_duplicates_hashes(sub[["phash"]], "phash", hamming_threshold)["is_duplicate"].to_numpy()
+        out.iloc[order, out.columns.get_loc("dup_phash")] = flagged
+
+    if "embeddings" in out.columns and not out["embeddings"].isna().all():
+        survivors = [i for i in order if not out["dup_phash"].iat[i]]
+        if survivors:
+            sub = out.iloc[survivors]
+            flagged = remove_near_duplicates_embeddings(sub[["embeddings"]].assign())["is_duplicate"].to_numpy()
+            # remove_near_duplicates_embeddings keeps row order of `sub`, which is already time-ordered
+            out.iloc[survivors, out.columns.get_loc("dup_embedding")] = flagged
+
+    out["is_duplicate"] = out["dup_phash"] | out["dup_embedding"]
+    return out
+
 
 # ==============================================================================
 # 7. LEAKAGE-FREE TEMPORAL & UPLOADER-GROUPED SPLIT
@@ -430,16 +552,12 @@ def run_pipeline(source: Union[str, Path, pd.DataFrame], output_dir: Optional[Pa
     
     df = pd.concat(chunks, ignore_index=True)
     
-    if "image_path" in df.columns and _HASH_AVAILABLE:
-        df = mark_near_duplicates_phash(df)
-    elif "embeddings" in df.columns:
-        df = remove_near_duplicates_embeddings(df)
-    else:
-        df["is_duplicate"] = False
-        
+    df = dedup_dataframe(df)
+    report.duplicate_phash_removed = int(df["dup_phash"].sum())
+    report.duplicate_embedding_removed = int(df["dup_embedding"].sum())
     report.duplicate_hashes_removed = int(df["is_duplicate"].sum())
-    df = df[~df["is_duplicate"]].drop(columns=["is_duplicate"]).reset_index(drop=True)
-    
+    df = df[~df["is_duplicate"]].drop(columns=["is_duplicate", "dup_phash", "dup_embedding"]).reset_index(drop=True)
+
     train_df, val_df, test_df = temporal_group_split(df, report=report)
     
     if output_dir:
