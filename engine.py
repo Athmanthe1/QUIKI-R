@@ -23,6 +23,7 @@ import logging
 from common import (MODEL_NAME, AsymmetricLoss, WikimediaClassifier, extract_tensor,
                     load_head_npz)
 from manifest import ManifestError, read_manifest
+from dag import load_category_graph, post_process_dag
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
 logger = logging.getLogger("CommonsEngine")
@@ -91,6 +92,9 @@ class CategoryEngine:
         logger.info("Computing text prototypes for real dataset...")
         protos = np.array([self._get_text_prototypes(name) for name in man.classes]).astype('float32')
 
+        # Real hierarchy replaces the toy graph. A missing graph file means NO hierarchy (empty
+        # graph), never the demo graph, whose edges would be wrong for the real class space.
+        self.category_graph = load_category_graph(man.path(artifact_dir, "graph"))
         self.index, self.index_labels = index, index_labels
         self.category_map = category_map
         self.category_inv_map = man.class_to_id
@@ -232,17 +236,8 @@ class CategoryEngine:
             calibrated[cat] = float(1.0 / (1.0 + np.exp(-scale * (score - threshold))))
         return calibrated
 
-    def _post_process_dag(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        sorted_cands = sorted(candidates, key=lambda x: x['confidence'], reverse=True)
-        selected_names = {c['category'] for c in sorted_cands}
-        final = []
-        for c in sorted_cands:
-            name = c['category']
-            if name in self.category_graph.nodes:
-                if any(desc in selected_names for desc in nx.descendants(self.category_graph, name)):
-                    continue
-            final.append(c)
-        return final
+    def _post_process_dag(self, candidates: List[Dict[str, Any]], threshold: float = 0.5) -> List[Dict[str, Any]]:
+        return post_process_dag(candidates, self.category_graph, threshold=threshold)
 
     def suggest(self, image: Union[str, Image.Image, bytes, Any], metadata: Optional[Dict] = None,
                 top_k: int = 10, n_neighbors: int = 6, **kwargs) -> List[Dict[str, Any]]:
