@@ -33,24 +33,39 @@ def extract_tensor(output: Any) -> torch.Tensor:
         raise TypeError(f"Unexpected model output type: {type(output)}")
 
 
-class AsymmetricLoss(nn.Module):
-    """Asymmetric Loss (PDF section 3). Moved here unchanged from engine.py/trainer.py; fixed in the ASL commit."""
+POS, UNK, NEG = 1.0, 0.0, -1.0     # three-state target encoding
 
-    def __init__(self, gamma_neg=4.0, gamma_pos=1.0, margin=0.05, eps=1e-8):
+
+class AsymmetricLoss(nn.Module):
+    """Asymmetric Loss, PDF section 3, with explicit three-state targets.
+
+    ``targets`` has the same shape as ``logits`` with values
+        +1  positive            -> -(1-p)^gamma_pos * log p
+         0  unknown (unlabelled)-> -p_m^gamma_neg * log(1 - p_m),   p_m = max(p - margin, 0)
+        -1  explicit reject     -> -log(1 - p)        (full strength: no margin, no focal weight)
+    Plain multi-hot {0, 1} targets are valid input and mean positive / unknown (a missing label is
+    NOT a hard negative). ``unknown_weight=0`` ignores unknowns entirely. Reduction: sum over
+    classes, mean over the batch.
+    """
+
+    def __init__(self, gamma_neg: float = 4.0, gamma_pos: float = 0.0, margin: float = 0.05,
+                 unknown_weight: float = 1.0, eps: float = 1e-8):
         super().__init__()
         self.gamma_neg = gamma_neg
         self.gamma_pos = gamma_pos
         self.margin = margin
+        self.unknown_weight = unknown_weight
         self.eps = eps
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        probs = torch.sigmoid(logits)
-        pos_weight = (1 - probs) ** self.gamma_pos
-        pos_loss = -targets * pos_weight * torch.log(probs + self.eps)
-        probs_neg = torch.clamp(probs - self.margin, min=0.0)
-        neg_weight = probs_neg ** self.gamma_neg
-        neg_loss = -(1 - targets) * neg_weight * torch.log(1 - probs + self.eps)
-        return (pos_loss + neg_loss).sum(dim=-1).mean()
+        p = torch.sigmoid(logits)
+        pos_loss = -((1.0 - p) ** self.gamma_pos) * torch.nn.functional.logsigmoid(logits)
+        p_m = torch.clamp(p - self.margin, min=0.0)
+        unk_loss = -(p_m ** self.gamma_neg) * torch.log(torch.clamp(1.0 - p_m, min=self.eps))
+        neg_loss = -torch.nn.functional.logsigmoid(-logits)          # == -log(1 - p), numerically stable
+        loss = torch.where(targets > 0.5, pos_loss,
+                           torch.where(targets < -0.5, neg_loss, self.unknown_weight * unk_loss))
+        return loss.sum(dim=-1).mean()
 
 
 class WikimediaClassifier(nn.Module):
