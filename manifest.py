@@ -27,7 +27,7 @@ DEFAULT_FILES: Dict[str, str] = {
     "index_labels": "index_labels.json",       # row -> list of class ids (ints)
     "head": "supervised_head.npz",             # linear head: W [C, D], b [C]  (written by trainer.py)
     "graph": "category_graph.json",            # category DAG: {"edges": [[parent, child], ...]}
-    "thumbs": "neighbor_thumbs.npz",           # sidecar: 64px thumbnails for explainability
+    "thumbs": "neighbor_thumbs.npy",           # sidecar: uint8 [N, 64, 64, 3] thumbnails, row-aligned with the index
     "stacker": "stacker.json",                 # logistic-regression fusion (written by fit_stacker)
     "text_prototypes": "text_prototypes.npy",  # cached [C, D] text prototypes
     "embeddings": "dataset_embeddings.parquet",
@@ -49,6 +49,8 @@ class Manifest:
     n_vectors: int = 0
     files: Dict[str, str] = field(default_factory=lambda: dict(DEFAULT_FILES))
     class_counts: Optional[List[int]] = None       # train images per class, aligned with `classes`
+    logit_scale: Optional[float] = None            # SigLIP log-scale (text scorer: sigmoid(exp(s) * z.t + b))
+    logit_bias: Optional[float] = None
     created_at: float = field(default_factory=time.time)
     notes: str = ""
 

@@ -25,35 +25,28 @@ logger = logging.getLogger("OfflineTrainer")
 # 2. DATASET (Reads pre-computed embeddings from Parquet)
 # ==============================================================================
 class EmbeddingDataset(Dataset):
+    """TRAIN-split rows of dataset_embeddings.parquet. Targets are three-state: +1 for the image's
+    categories (multi-label ``categories`` list), 0 (unknown) for everything else. Nothing is a hard
+    negative here: a missing label is unknown, only editor rejects (engine feedback) are negatives."""
+
     def __init__(self, parquet_path: str, category_map: dict):
         logger.info(f"Loading embeddings from {parquet_path}...")
-        self.df = pd.read_parquet(parquet_path)
+        df = pd.read_parquet(parquet_path, columns=["split", "categories", "embedding"])
+        self.df = df[df["split"] == "train"].reset_index(drop=True)
         self.category_map = category_map
         self.num_classes = len(category_map)
-        logger.info(f"Loaded {len(self.df)} samples with {self.num_classes} classes.")
+        logger.info(f"Loaded {len(self.df)} train samples with {self.num_classes} classes.")
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        
-        # 1. Get Embedding
-        emb = np.array(row['embedding'], dtype=np.float32)
-        embedding_tensor = torch.tensor(emb)
-        
-        # 2. Get Multi-hot Target
+        embedding_tensor = torch.tensor(np.asarray(row["embedding"], dtype=np.float32))
         target = torch.zeros(self.num_classes, dtype=torch.float32)
-        cats = row['category']
-        if isinstance(cats, str):
-            cats = [cats]
-        elif not isinstance(cats, list):
-            cats = [str(cats)]
-            
-        for c in cats:
+        for c in row["categories"]:
             if c in self.category_map:
                 target[self.category_map[c]] = 1.0
-                
         return embedding_tensor, target
 
 # ==============================================================================
@@ -108,8 +101,9 @@ def run_test():
         for i in range(num_samples):
             embs[i][i % num_classes] += 5.0                       # inject signal so the loss can drop
         pd.DataFrame({
-            'image_path': [f"img_{i}.jpg" for i in range(num_samples)],
-            'category': [classes[i % num_classes] for i in range(num_samples)],
+            'split': ['train'] * num_samples,
+            'categories': [[classes[i % num_classes]] + ([classes[(i + 1) % num_classes]] if i % 3 == 0 else [])
+                           for i in range(num_samples)],          # multi-label
             'embedding': [e.tolist() for e in embs],
         }).to_parquet(os.path.join(temp_dir, "dataset_embeddings.parquet"), index=False)
 
