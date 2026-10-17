@@ -14,7 +14,7 @@ The scorers are fused by logistic-regression stacking over the union of each sco
 no min-max scaling), then a category-DAG post-process suppresses an ancestor only if an above-threshold descendant is selected.
 Problem statement: the supplied PDF is authoritative; where this repo and the PDF disagreed, v1.4 follows the PDF.
 
-> **Status (read this).** The logic is unit-tested (106 tests, run without torch/faiss/network). **No real evaluation numbers exist yet**:
+> **Status (read this).** The logic is unit-tested (100+ tests, run without torch/faiss/network). **No real evaluation numbers exist yet**:
 > the build environment had no access to Hugging Face, PyPI or Commons, so SigLIP, FAISS and the MediaWiki API were never executed there.
 > Numbers appear in this repo only when `evaluate.py` produces them on real artifacts (see *Metrics*). The live demo shows a
 > banner telling you whether it runs on **real artifacts**, the small built-in **demo knowledge base**, or **mock mode**.
