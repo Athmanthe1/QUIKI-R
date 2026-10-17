@@ -13,3 +13,4 @@ logs/
 .DS_Store
 # per-user feedback written at runtime
 feedback/*.jsonl
+.cache/

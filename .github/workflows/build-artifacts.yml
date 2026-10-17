@@ -1,0 +1,25 @@
+name: build-artifacts
+# Manual run on a runner WITH network access: seed data -> clean -> extract (real SigLIP) -> train -> fit stacker ->
+# evaluate. Uploads artifacts/ (index, head, stacker, manifest) and eval/ (the only source of reportable metrics).
+on:
+  workflow_dispatch:
+    inputs:
+      per_category: {description: "images per category", default: "40"}
+      min_freq: {description: "min train images per class", default: "20"}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: python build_seed_dataset.py --out_dir seed --per_category ${{ inputs.per_category }}
+      - run: python cleaning_and_split.py --source seed/raw_records.jsonl --output_dir data --hidden_categories seed/hidden_categories.txt
+      - run: python extract_embeddings.py --splits_dir data --output_dir artifacts --min_freq ${{ inputs.min_freq }} --encoder siglip
+      - run: python trainer.py --artifacts_dir artifacts --epochs 15
+      - run: python fit_stacker.py --artifacts_dir artifacts
+      - run: python evaluate.py --artifacts_dir artifacts --split test --out_dir artifacts/eval --review_csv_out artifacts/eval/review_template.csv
+      - uses: actions/upload-artifact@v4
+        with: {name: quiki-artifacts, path: artifacts/}
