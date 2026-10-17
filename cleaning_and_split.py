@@ -540,12 +540,17 @@ def temporal_group_split(df: pd.DataFrame, ratios: Tuple[float, float, float] = 
 # ==============================================================================
 # 8. FULL PIPELINE ORCHESTRATOR
 # ==============================================================================
-def run_pipeline(source: Union[str, Path, pd.DataFrame], output_dir: Optional[Path] = None) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, CleaningReport]:
+def run_pipeline(source: Union[str, Path, pd.DataFrame], output_dir: Optional[Path] = None,
+                 hidden_categories: Optional[Iterable[str]] = None, canonicalize: bool = False
+                 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, CleaningReport]:
+    """Clean -> dedup -> temporal + uploader-disjoint split. ``hidden_categories`` is the Commons hidden-category set
+    (preferred over the regex fallback, see bug 7)."""
     report = CleaningReport()
     chunks = []
-    
+    hidden = list(hidden_categories) if hidden_categories is not None else None
+
     for raw_chunk in load_raw_records(source):
-        cleaned, report = clean_records(raw_chunk, report)
+        cleaned, report = clean_records(raw_chunk, report, hidden_categories=hidden, canonicalize=canonicalize)
         if len(cleaned) > 0: chunks.append(cleaned)
         
     if not chunks: raise ValueError("No valid records after cleaning.")
@@ -669,5 +674,31 @@ class TestWikimediaPipeline(unittest.TestCase):
         self.assertEqual(len(train) + len(val) + len(test), 10)
 
 # FIX: Corrected the entry point so tests actually run!
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    import argparse
+    ap = argparse.ArgumentParser(description="Clean raw Commons records and split them temporally (uploader-disjoint).")
+    ap.add_argument("--source", help="raw records: .jsonl / .json / .csv / .parquet")
+    ap.add_argument("--output_dir", default="data", help="writes train/val/test.parquet and cleaning_report.txt")
+    ap.add_argument("--hidden_categories", help="text file, one hidden category per line (preferred over regex fallback)")
+    ap.add_argument("--canonicalize", action="store_true", help="normalise category names (prefix, underscores, case)")
+    ap.add_argument("--test", action="store_true", help="run the unit tests")
+    a = ap.parse_args(argv)
+    if a.test:
+        unittest.main(argv=["cleaning_and_split"], verbosity=2)
+        return
+    if not a.source:
+        ap.error("--source is required")
+    hidden = None
+    if a.hidden_categories:
+        hidden = [ln.strip() for ln in Path(a.hidden_categories).read_text(encoding="utf-8").splitlines() if ln.strip()]
+    logging.basicConfig(level=logging.INFO)
+    tr, va, te, rep = run_pipeline(a.source, Path(a.output_dir), hidden_categories=hidden, canonicalize=a.canonicalize)
+    print(rep.summary())
+    print(f"train={len(tr)} val={len(va)} test={len(te)}")
+
+
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    if len(os.sys.argv) == 1:
+        unittest.main(verbosity=2)
+    else:
+        main()
