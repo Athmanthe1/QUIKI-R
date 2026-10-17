@@ -14,3 +14,4 @@ logs/
 # per-user feedback written at runtime
 feedback/*.jsonl
 .cache/
+
