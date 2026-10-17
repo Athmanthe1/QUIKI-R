@@ -12,6 +12,8 @@ import json
 import os
 import tempfile
 import time
+
+import numpy as np
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Union
@@ -20,6 +22,7 @@ MANIFEST_NAME = "manifest.json"
 SCHEMA_VERSION = 1
 SIGLIP_MODEL_NAME = "google/siglip-base-patch16-224"
 SIGLIP_EMBED_DIM = 768
+MODEL_NAME = SIGLIP_MODEL_NAME
 
 # Canonical artifact file names (relative to the artifact directory).
 DEFAULT_FILES: Dict[str, str] = {
@@ -116,3 +119,13 @@ def read_manifest(directory: Union[str, Path], expected_dim: Optional[int] = Non
     m = Manifest(files=files, **known)
     _validate(m, expected_dim)
     return m
+
+
+def save_head_npz(path: Union[str, Path], W: "np.ndarray", b: "np.ndarray") -> None:
+    """Linear head as plain arrays (W [C, D], b [C]); readable without torch."""
+    np.savez(path, W=np.asarray(W, dtype="float32"), b=np.asarray(b, dtype="float32"))
+
+
+def load_head_npz(path: Union[str, Path]):
+    with np.load(path) as z:
+        return z["W"].astype("float32"), z["b"].astype("float32")

@@ -23,7 +23,6 @@ import inspect
 import json
 import logging
 import os
-import pickle
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,7 +46,7 @@ st.set_page_config(
 SUPPORTED_TYPES = ["jpg", "jpeg", "png"]
 # Keys that can sit next to the category map in an engine response and must
 # never be mistaken for category names.
-NON_CATEGORY_KEYS = {"neighbors", "nearest_neighbors", "references", "knn", "metadata", "meta", "latency", "status"}
+NON_CATEGORY_KEYS = {"neighbors", "nearest_neighbors", "references", "knn", "metadata", "meta", "latency", "status", "health", "state"}
 DEFAULT_SUGGESTIONS = [
     {
         "category": "Cultural heritage monuments",
@@ -89,7 +88,7 @@ MODE_BANNERS = {
     MODE_REVIEW: (
         "success", "✅", "Mode 2 · Review & Feedback",
         "Human-in-the-loop curation. Accept correct categories (positive examples) and reject wrong ones "
-        "(hard negatives). Every click is sent to the engine straight away.",
+        "(hard negatives). Every click is stored in your session straight away (accepts also join this session's nearest-neighbour index).",
     ),
     MODE_TRAIN: (
         "warning", "🧠", "Mode 3 · Train",
@@ -102,7 +101,7 @@ GUIDE_MARKDOWN = """
 **Modes**
 - **① Suggest**: runs the engine on your image and ranks likely Commons categories.
 - **② Review & Feedback**: you confirm (Accept) or correct (Reject) each suggestion; the engine learns from every click.
-- **③ Train**: fits a small classifier on the feedback buffer so future suggestions improve.
+- **③ Train**: fits a small classifier head on your feedback (your session only; other visitors are not affected).
 
 **Input gateway**
 - **Image**: JPG or PNG. Sideways phone photos are auto-rotated; corrupt files are rejected.
@@ -111,41 +110,54 @@ GUIDE_MARKDOWN = """
 - **Suggestions to return**: how many categories to show, best first.
 
 **Reading a result**
-- **Confidence**: the engine's overall certainty (High ≥ 80%, Medium 50–79%, Low < 50%).
-- **KNN / TXT / META / CLS**: the individual scorers: similarity to already-indexed images, image-to-category-name match, title/description match, and the trained classifier (0% until you train it in Mode 3).
+- **Confidence**: the estimated probability that the category is right (High ≥ 80%, Medium 50–79%, Low < 50%). It is calibrated by logistic stacking when the artifacts include `stacker.json`; otherwise it is an *uncalibrated* mean of the available scorers and the card says so.
+- **KNN / TXT / META / CLS**: the individual scorers: vote of the nearest indexed images, image-to-category-name match (SigLIP), title/description match, and the trained classifier. A scorer that is not available (no index, no description, no trained head) is listed as missing and carries no weight.
+- **Nearest neighbours**: the real indexed images behind the kNN vote (and images you accepted in this session).
 - **📂 path**: where the category sits in the Commons category hierarchy.
 
 **Training terms**
 - **Accept = positive, Reject = hard negative**: a rejection is a stronger signal than a missing label.
-- **Epochs / Learning rate / Batch size**: see the notes under each control in Mode 3.
-- **Asymmetric loss**: a loss that down-weights easy negatives and tolerates missing labels.
+- **Epochs / Learning rate / Batch size**: see the notes under each control in Mode 3. Batch size sets the real mini-batch size.
+- **Asymmetric loss**: a loss that down-weights easy negatives and tolerates missing labels; a reject is a full-strength negative.
+- **F1**: measured on held-out feedback images when there are enough of them, otherwise on the training feedback (the result says which).
 """
 
 
 @dataclass
 class Backend:
-    """Resolved backend callable and its human-readable status."""
+    """Resolved backend callable and its human-readable status. The engine inside is READ-ONLY and shared;
+    per-visitor state lives in the Session returned by ``_session``."""
 
     predictor: Optional[Callable[..., Any]]
-    status: str
+    status: str          # "live" (an engine answered) or "mock" (no engine; sample results)
     detail: str
-    impl: Any = None  # the live CategoryEngine instance (None in mock mode)
+    impl: Any = None     # the shared CategoryEngine (None in mock mode)
+
+    @property
+    def state(self) -> dict[str, Any]:
+        if self.impl is not None and hasattr(self.impl, "state_summary"):
+            return self.impl.state_summary()
+        return {"mode": "mock", "detail": self.detail, "load_error": None, "n_classes": 0, "n_vectors": 0,
+                "index_type": "none", "calibrated": False, "has_head": False, "notes": []}
+
+    @property
+    def mode(self) -> str:
+        """'artifacts' (real data), 'demo' (toy knowledge base) or 'mock' (no engine)."""
+        return "mock" if self.impl is None else str(self.state.get("mode", "demo"))
 
     @property
     def can_learn(self) -> bool:
-        """True when the live engine exposes the continual-learning contract."""
         return self.status == "live" and callable(getattr(self.impl, "record_feedback", None))
 
     @property
     def can_train(self) -> bool:
         return self.status == "live" and callable(getattr(self.impl, "train_supervised_head", None))
 
-    def send_feedback(self, image: Image.Image, category: str, verdict: str) -> bool:
-        """Forward an accept/reject to the engine; rejects become hard negatives."""
-        if not self.can_learn or image is None:
+    def send_feedback(self, image: Image.Image, category: str, verdict: str, session: Any) -> bool:
+        """Forward an accept/reject to THIS visitor's session; rejects become hard negatives."""
+        if not self.can_learn or image is None or session is None:
             return False
-        self.impl.record_feedback(image, category, accepted=(verdict == "accept"))
-        return True
+        return bool(self.impl.record_feedback(image, category, accepted=(verdict == "accept"), session=session))
 
 
 def _safe_text(value: Any) -> str:
@@ -221,6 +233,9 @@ def _normalise_suggestions(raw: Any) -> list[dict[str, Any]]:
             entry = {"category": category, "confidence": score, "path": path, "reason": reason}
             if scorer_map:
                 entry["scores"] = {str(k): _confidence(v) for k, v in scorer_map.items()}
+            if isinstance(item, Mapping):
+                entry["calibrated"] = item.get("calibrated")
+                entry["missing"] = [str(m) for m in (item.get("missing") or [])]
             suggestions.append(entry)
     return suggestions
 
@@ -243,7 +258,8 @@ def _normalise_neighbors(raw: Any) -> list[dict[str, Any]]:
     return result
 
 
-def _call_predictor(predictor: Callable[..., Any], image: Image.Image, metadata: dict[str, str], top_k: int) -> Any:
+def _call_predictor(predictor: Callable[..., Any], image: Image.Image, metadata: dict[str, str], top_k: int,
+                    session: Any = None) -> Any:
     payload = {
         "image": image,
         "image_input": image,  # V1.2 engine: suggest(image_input, metadata=None, top_k=10)
@@ -252,6 +268,7 @@ def _call_predictor(predictor: Callable[..., Any], image: Image.Image, metadata:
         "geotag": metadata["geotag"],
         "metadata": metadata,
         "top_k": top_k,
+        "session": session,
     }
     try:
         signature = inspect.signature(predictor)
@@ -269,124 +286,50 @@ def _call_predictor(predictor: Callable[..., Any], image: Image.Image, metadata:
             return predictor(image)  # last resort for engines taking only the image as first positional arg
 
 
-def _kb_dirs() -> list[str]:
-    """Folders searched for knowledge-base files; override with COMMONS_DATA_DIR."""
-    extra = os.environ.get("COMMONS_DATA_DIR")
-    return ([extra] if extra else []) + [".", "data", "outputs", "artifacts"]
-
-
-def _read_kb_file(path: Path) -> Any:
-    suffix = path.suffix.lower()
-    if suffix == ".json":
-        return json.loads(path.read_text(encoding="utf-8"))
-    if suffix in {".pkl", ".pickle"}:
-        with path.open("rb") as handle:  # only load pickles you produced yourself
-            return pickle.load(handle)
-    frame = pd.read_parquet(path) if suffix == ".parquet" else pd.read_csv(path)
-    return frame.to_dict("records")
-
-
-def _knowledge_base_kwargs(loader: Callable[..., Any]) -> tuple[dict[str, Any], list[str]]:
-    """Fill each required loader argument from a same-named data file (e.g. categories.json)."""
-    kwargs: dict[str, Any] = {}
-    missing: list[str] = []
-    for param in inspect.signature(loader).parameters.values():
-        required = param.default is inspect.Parameter.empty and param.kind in (
-            inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-        if not required:
-            continue
-        found = next(
-            (Path(folder) / f"{param.name}{ext}" for folder in _kb_dirs() for ext in (".json", ".pkl", ".pickle", ".parquet", ".csv")
-             if (Path(folder) / f"{param.name}{ext}").is_file()),
-            None,
-        )
-        if found is None:
-            missing.append(param.name)
-        else:
-            kwargs[param.name] = _read_kb_file(found)
-    return kwargs, missing
-
-
-ARTIFACT_FILES = ("manifest.json",)   # the manifest names every other file
-
-
-def _try_load_production_artifacts(impl: Any) -> tuple[bool, bool]:
-    """Load locally trained artifacts from artifacts/ if all four files exist.
-
-    Never raises: a missing folder, missing file or failed load is logged and the engine
-    keeps its built-in default knowledge base. Returns (loaded, tainted): `tainted` means the
-    engine's own loader started and then failed, so it may hold half-replaced state and the
-    caller should rebuild a fresh instance.
-    """
-    called = False
-    try:
-        loader = getattr(impl, "load_production_artifacts", None)
-        if not callable(loader):
-            return False, False  # older engine build without the artifacts bridge
-        folders = [Path("artifacts"), Path(__file__).resolve().parent / "artifacts"]
-        folder = next((f for f in folders if all((f / name).is_file() for name in ARTIFACT_FILES)), None)
-        if folder is None:
-            raise FileNotFoundError("artifacts/ must contain " + ", ".join(ARTIFACT_FILES))
-        called = True
-        loader(str(folder))
-        logger.info("Loaded production artifacts from %s", folder)
-        return True, False
-    except Exception as e:
-        logger.warning(f"Artifacts not found or failed to load: {e}. Falling back to default knowledge base.")
-        return False, called
+def _find_artifact_dir() -> Optional[str]:
+    """Folder holding manifest.json: $QUIKI_ARTIFACTS_DIR, ./artifacts, or <app dir>/artifacts. If none exists and
+    $QUIKI_HF_REPO is set, try to download the artifacts from the Hugging Face Hub (needs network)."""
+    candidates = [os.environ.get("QUIKI_ARTIFACTS_DIR"), "artifacts", str(Path(__file__).resolve().parent / "artifacts")]
+    for c in candidates:
+        if c and (Path(c) / "manifest.json").is_file():
+            return str(c)
+    repo = os.environ.get("QUIKI_HF_REPO")
+    if repo:
+        try:
+            from huggingface_hub import snapshot_download
+            target = Path(__file__).resolve().parent / "artifacts"
+            snapshot_download(repo_id=repo, repo_type="dataset", local_dir=str(target))
+            if (target / "manifest.json").is_file():
+                return str(target)
+        except Exception as exc:
+            logger.warning("could not download artifacts from %s: %s", repo, exc)
+    return None
 
 
 @st.cache_resource(show_spinner=False)
 def load_backend() -> Backend:
-    """Import the model once; failures remain visible but never break the UI."""
+    """Build the shared, read-only engine once. Failures stay visible (mock mode) but never break the UI."""
     try:
         module = importlib.import_module("engine")
-    except Exception as exc:  # backend libraries can fail during model initialisation
-        return Backend(None, "mock", f"engine.py unavailable: {type(exc).__name__}")
+    except Exception as exc:  # backend libraries can fail during import
+        return Backend(None, "mock", f"engine.py unavailable: {type(exc).__name__}: {exc}")
+    try:
+        engine = module.CategoryEngine(artifact_dir=_find_artifact_dir())
+    except Exception as exc:
+        return Backend(None, "mock", f"engine initialisation failed: {type(exc).__name__}: {exc}")
+    return Backend(engine.suggest, "live", str(engine.status.get("detail", "")), impl=engine)
 
-    for function_name in ("predict", "suggest_categories", "classify", "infer", "run_inference"):
-        candidate = getattr(module, function_name, None)
-        if callable(candidate):
-            return Backend(candidate, "live", f"engine.{function_name} connected")
-    for class_name in ("CategoryEngine", "CategorySuggestionEngine", "CommonsCategoryEngine", "InferenceEngine"):
-        engine_class = getattr(module, class_name, None)
-        if callable(engine_class):
-            try:
-                # Built once per server process thanks to @st.cache_resource, so the
-                # loaded knowledge base survives every Streamlit rerun.
-                instance = engine_class()
-                # Real locally trained artifacts win when present; otherwise the engine keeps
-                # its built-in default knowledge base (the GitHub Codespaces demo case).
-                artifacts_loaded, tainted = _try_load_production_artifacts(instance)
-                if tainted:
-                    # A failed load can leave the engine half-swapped (new category map, old embeddings),
-                    # so start over from a clean instance that still has the default knowledge base.
-                    instance = engine_class()
-                kb_note = ""
-                for loader_name in ("load_knowledge_base", "load_index", "load", "setup"):
-                    if artifacts_loaded:
-                        break  # the artifacts already supplied the knowledge base
-                    loader = getattr(instance, loader_name, None)
-                    if callable(loader):
-                        kwargs, missing = _knowledge_base_kwargs(loader)
-                        if missing:
-                            kb_note = (f" ({loader_name} needs {', '.join(missing)}; no matching file found in "
-                                       f"{', '.join(_kb_dirs())})")
-                            logger.warning("No knowledge-base files for %s.%s%s. Using the engine's default knowledge base.",
-                                           class_name, loader_name, kb_note)
-                            break
-                        loader(**kwargs)
-                        break
-                if getattr(instance, "category_embeddings", True) is None:
-                    return Backend(None, "mock", f"{class_name}: knowledge base not loaded (category_embeddings is None){kb_note}")
-                for method_name in ("suggest", "predict", "suggest_categories", "classify", "infer"):
-                    method = getattr(instance, method_name, None)
-                    if callable(method):
-                        suffix = " · production artifacts loaded" if artifacts_loaded else ""
-                        return Backend(method, "live", f"engine.{class_name}.{method_name} connected{suffix}", impl=instance)
-            except Exception as exc:
-                return Backend(None, "mock", f"engine initialisation failed: {type(exc).__name__}: {exc}")
-    return Backend(None, "mock", "engine.py loaded, but no supported prediction entry point was found")
+
+def _session(backend: Backend) -> Any:
+    """This visitor's engine Session (feedback, overlay index, fine-tuned head), kept in st.session_state."""
+    if not backend.can_learn:
+        return None
+    session = st.session_state.get("engine_session")
+    if session is None:
+        session = backend.impl.new_session()
+        session.log_path = Path("feedback") / f"{session.id}.jsonl"   # append-only JSONL, one file per session
+        st.session_state["engine_session"] = session
+    return session
 
 
 def _mock_result(image: Image.Image, metadata: dict[str, str], top_k: int) -> dict[str, Any]:
@@ -421,19 +364,23 @@ def _attach_dag_paths(suggestions: list[dict[str, Any]], impl: Any) -> None:
             continue
 
 
-def _run_prediction(backend: Backend, image: Image.Image, metadata: dict[str, str], top_k: int) -> dict[str, Any]:
+def _run_prediction(backend: Backend, image: Image.Image, metadata: dict[str, str], top_k: int,
+                    session: Any = None) -> dict[str, Any]:
     started = time.perf_counter()
     if backend.predictor is None:
         result = _mock_result(image, metadata, top_k)
     else:
-        raw = _call_predictor(backend.predictor, image, metadata, top_k)
+        raw = _call_predictor(backend.predictor, image, metadata, top_k, session)
         neighbors = _normalise_neighbors(raw) if isinstance(raw, Mapping) else []
         result = {"suggestions": _normalise_suggestions(raw), "neighbors": neighbors}
+        if isinstance(raw, Mapping):
+            result["health"] = raw.get("health") or {}
+            result["state"] = raw.get("state") or {}
         _attach_dag_paths(result["suggestions"], backend.impl)
     # Rank best-first and respect the slider even if the engine returns more.
     result["suggestions"] = sorted(result["suggestions"], key=lambda s: s["confidence"], reverse=True)[:top_k]
     result["latency"] = time.perf_counter() - started
-    result["mode"] = backend.status
+    result["mode"] = backend.mode
     return result
 
 
@@ -502,8 +449,12 @@ def _reset_review() -> None:
     st.session_state["verdicts"] = {}
 
 
-def _feedback_stats() -> dict[str, int]:
-    return st.session_state.setdefault("feedback_stats", {"accept": 0, "reject": 0})
+def _session_counts(backend: Backend) -> dict[str, int]:
+    """Feedback held by THIS visitor's session, after later clicks have overridden earlier ones."""
+    session = st.session_state.get("engine_session")
+    if session is None or not backend.can_learn:
+        return {"images": 0, "positives": 0, "negatives": 0}
+    return session.counts()
 
 
 def record_feedback(image: Optional[Image.Image], category: str, verdict: str) -> None:
@@ -520,8 +471,7 @@ def record_feedback(image: Optional[Image.Image], category: str, verdict: str) -
         st.toast("Saved locally. Continual learning needs the live engine.", icon="ℹ️")
         return
     try:
-        if backend.send_feedback(image, category, verdict):
-            _feedback_stats()[verdict] = _feedback_stats().get(verdict, 0) + 1
+        if backend.send_feedback(image, category, verdict, _session(backend)):
             kind = "positive" if verdict == "accept" else "hard negative"
             st.toast(f"Recorded “{category}” as a {kind}.", icon="✅" if verdict == "accept" else "🚫")
         else:
@@ -547,10 +497,20 @@ def _request_run() -> None:
 def _render_header(backend: Backend) -> None:
     st.title("Commons Category Intelligence")
     st.caption("Multimodal suggestions for a cleaner, more discoverable Wikimedia Commons")
-    if backend.status == "live":
-        st.success(f"● LIVE ENGINE  ·  {backend.detail}")
+    state = backend.state
+    mode = backend.mode
+    if mode == "artifacts":
+        calibration = "calibrated probabilities" if state.get("calibrated") else "UNCALIBRATED scores (no stacker.json)"
+        st.success(f"● REAL ARTIFACTS  ·  {state.get('detail')}  ·  {calibration}")
+        for note in state.get("notes", []):
+            st.caption(f"ℹ️ {note}")
+    elif mode == "demo":
+        st.warning("● DEMO KNOWLEDGE BASE  ·  50 built-in toy categories, no image index, no trained head. "
+                   "Suggestions are NOT based on Commons data.")
+        if state.get("load_error"):
+            st.error(f"Production artifacts were found but failed to load: {state['load_error']}")
     else:
-        st.warning(f"● DEMO MODE  ·  {backend.detail}. The dashboard remains fully navigable with sample results.")
+        st.warning(f"● MOCK MODE  ·  {backend.detail}. The dashboard stays navigable with fixed sample results.")
 
 
 def _render_mode_banner(mode: str) -> None:
@@ -617,8 +577,11 @@ def _render_suggestion_card(item: dict[str, Any], index: int, interactive: bool)
             st.markdown(f"**{index:02d}  {category}**  :{colour}[● {label}]")
             st.caption(item.get("reason", "Multimodal evidence"))
         with right:
-            st.metric("Confidence", f"{score:.0%}", help="The engine's overall certainty that this category fits the image.")
-        st.progress(score, text=f"Model confidence · {score:.0%}")
+            calibrated = item.get("calibrated")
+            label = "Probability" if calibrated else ("Score (uncalibrated)" if calibrated is False else "Confidence")
+            st.metric(label, f"{score:.0%}", help="Estimated probability that this category is right. Calibrated by logistic "
+                      "stacking when stacker.json is present; otherwise an uncalibrated mean of the available scorers.")
+        st.progress(score, text=f"{('Probability' if item.get('calibrated') else 'Score')} · {score:.0%}")
         st.caption("📂  " + "  ›  ".join(item.get("path", [category])))
 
         scores = item.get("scores")
@@ -627,6 +590,9 @@ def _render_suggestion_card(item: dict[str, Any], index: int, interactive: bool)
             for col, (name, value) in zip(cols, scores.items()):
                 col.caption(f"{name.upper()} · {value:.0%}")
                 col.progress(value)
+        if item.get("missing"):
+            st.caption("Not available for this image: " + ", ".join(m.upper() for m in item["missing"]) +
+                       " (no weight given; see Scorer health)")
 
         verdict = _verdicts().get(category)
         if not interactive:
@@ -682,31 +648,50 @@ def _render_suggestions(result: Optional[dict[str, Any]], interactive: bool) -> 
 def _render_evidence(image: Optional[Image.Image], result: dict[str, Any]) -> None:
     with st.container(border=True):
         st.subheader("Explainability · nearest-neighbor evidence")
-        st.caption("Reference items retrieved from the vector space that influenced the ranking.")
+        st.caption("Indexed images that voted for the categories above (64px thumbnails). Images you accepted in this "
+                   "session are marked as such.")
         neighbors = result.get("neighbors") or []
         if not neighbors:
-            if result.get("mode") == "live":
-                st.info(
-                    "🔍 Explainability Panel: The current fundamental engine operates in bounded-cost "
-                    "Zero-Shot/Retrieval mode. Nearest-neighbour reference images are omitted to guarantee "
-                    "sub-second latency on cloud CPUs. Trust the multi-scorer breakdown (kNN, Text, Meta, Classifier) "
-                    "provided in the suggestion cards."
-                )
-            else:
-                st.info("Demo mode: no reference thumbnails are generated. The uploaded image is shown as the query anchor.")
+            reason = (result.get("health") or {}).get("knn", {}).get("detail")
+            if result.get("mode") == "mock":
+                st.info("Mock mode: no reference thumbnails are generated. The uploaded image is shown as the query anchor.")
                 if image is not None:
                     st.image(image, caption="Uploaded image · query anchor", width=180)
+            else:
+                st.info(f"No neighbours to show: {reason or 'the kNN scorer returned nothing'}.")
             return
         columns = st.columns(min(3, len(neighbors)))
         for index, neighbor in enumerate(neighbors):
             with columns[index % len(columns)]:
-                reference = _display_neighbor(neighbor.get("image"), image)
+                reference = _display_neighbor(neighbor.get("image"), None)
                 if reference is not None:
                     try:
                         st.image(reference, use_container_width=True)
-                    except Exception:  # broken path/URL must not take the page down
+                    except Exception:  # broken thumbnail must not take the page down
                         st.caption("🖼️ Thumbnail unavailable")
-                st.caption(f"{neighbor['label']} · {_confidence(neighbor['score']):.0%} similarity")
+                else:
+                    st.caption("🖼️ No thumbnail stored for this item")
+                source = " · this session" if neighbor.get("source") == "session" else ""
+                st.caption(f"{neighbor['label']} · {_confidence(neighbor['score']):.0%} similarity{source}")
+
+
+_HEALTH_ICON = {"ok": "✅", "unavailable": "⚪", "error": "❌"}
+
+
+def _render_health(result: dict[str, Any]) -> None:
+    """Scorer health: which scorers ran, which were unavailable and why, which failed."""
+    health = result.get("health") or {}
+    if not health:
+        return
+    failing = [n for n, h in health.items() if h.get("status") == "error"]
+    with st.expander("Scorer health" + (f" · ⚠️ {len(failing)} failing" if failing else ""), expanded=bool(failing)):
+        for name in ("knn", "txt", "meta", "cls"):
+            if name in health:
+                h = health[name]
+                st.markdown(f"{_HEALTH_ICON.get(h.get('status'), '•')} **{name.upper()}** · {h.get('status')}"
+                            + (f" · {h.get('detail')}" if h.get("detail") else ""))
+        if failing:
+            st.caption("A failing scorer is logged on the server and ignored for this result; the others still count.")
 
 
 def _render_review_export(result: dict[str, Any]) -> None:
@@ -760,6 +745,7 @@ def _page_suggest(image: Optional[Image.Image], result: Optional[dict[str, Any]]
     if _render_suggestions(result, interactive=False) and result:
         st.write("")
         _render_evidence(image if image is not None else st.session_state.get("_img"), result)
+        _render_health(result)
 
 
 def _page_review(result: Optional[dict[str, Any]]) -> None:
@@ -778,9 +764,9 @@ def _page_review(result: Optional[dict[str, Any]]) -> None:
                 st.caption(f"**Title:** {meta['title']}")
             if meta.get("geotag"):
                 st.caption(f"**Geotag:** {meta['geotag']}")
-            stats = _feedback_stats()
-            st.metric("Accepted this session", stats.get("accept", 0), help="Positive examples sent to the engine since the app started.")
-            st.metric("Rejected this session", stats.get("reject", 0), help="Hard negatives sent to the engine since the app started.")
+            counts = _session_counts(load_backend())
+            st.metric("Accepted (current)", counts["positives"], help="Positive examples in your session. Changing your mind on a category replaces the earlier click.")
+            st.metric("Rejected (current)", counts["negatives"], help="Hard negatives in your session.")
     with right:
         _render_suggestions(result, interactive=True)
     st.write("")
@@ -830,28 +816,28 @@ def _page_train(backend: Backend) -> None:
     if not live:
         st.info("Training requires the live engine.")
 
-    stats = _feedback_stats()
+    counts = _session_counts(backend)
     with st.container(border=True):
         st.subheader("Feedback buffer")
-        st.caption("What the engine has collected from Mode 2 so far this session.")
+        st.caption("Your session's feedback from Mode 2, stored per image (a later click on the same category replaces the earlier one).")
         a, b, c = st.columns(3)
-        a.metric("Positives (accepts)", stats.get("accept", 0), help="Categories you confirmed as correct.")
-        b.metric("Hard negatives (rejects)", stats.get("reject", 0), help="Categories you marked as wrong.")
-        c.metric("Total events", stats.get("accept", 0) + stats.get("reject", 0), help="Everything training can learn from.")
+        a.metric("Positives (accepts)", counts["positives"], help="Categories you confirmed as correct.")
+        b.metric("Hard negatives (rejects)", counts["negatives"], help="Categories you marked as wrong.")
+        c.metric("Images with feedback", counts["images"], help="Training rows: one per image, not one per click.")
 
     controls, outcome = st.columns([1, 1.2], gap="large")
     with controls:
         with st.container(border=True):
             st.subheader("Training controls")
             epochs = st.slider("Epochs", 1, 20, 5, key="train_epochs", disabled=not live,
-                               help="Passes over the whole feedback buffer.")
+                               help="Passes over your feedback (plus a fresh replay sample of indexed training images each pass).")
             st.caption("More epochs fit your feedback more tightly, but a small buffer can be over-fitted.")
             lr = st.number_input("Learning Rate", min_value=1e-5, max_value=1e-2, value=1e-4, format="%.5f",
                                  key="train_lr", disabled=not live, help="Size of each update step.")
             st.caption("Too high makes the loss jump around; too low barely changes the classifier.")
             batch_size = st.slider("Batch Size", 8, 64, 32, key="train_batch", disabled=not live,
-                                   help="Feedback samples used per update step.")
-            st.caption("Smaller batches give noisier but more frequent updates; larger ones are steadier.")
+                                   help="Images per update step: real mini-batches.")
+            st.caption("Smaller batches mean more, noisier updates per epoch; larger ones are steadier. The result shows batches per epoch.")
             run_training = st.button(
                 "🚀 Run Micro-Training on Feedback Buffer", type="primary", key="run_training",
                 disabled=not live, use_container_width=True,
@@ -861,14 +847,15 @@ def _page_train(backend: Backend) -> None:
     if run_training:
         with st.spinner("Training the supervised head on the feedback buffer…"):
             try:
-                metrics = backend.impl.train_supervised_head(epochs=epochs, lr=float(lr), batch_size=batch_size)
+                metrics = backend.impl.train_supervised_head(epochs=epochs, lr=float(lr), batch_size=batch_size,
+                                                             session=_session(backend))
             except Exception as exc:
                 st.error(f"Training could not complete: {type(exc).__name__}: {exc}")
             else:
                 metrics = dict(metrics or {})
                 st.session_state["last_training"] = metrics
                 if int(metrics.get("samples") or 0) > 0:
-                    st.toast("Supervised head updated! The engine will now use the trained classifier for future inferences.", icon="🧠")
+                    st.toast("Head updated for your session. The CLS scorer now uses it.", icon="🧠")
                 else:
                     st.toast("Nothing to train on yet. Accept or reject suggestions in Mode 2 first.", icon="⚠️")
 
@@ -881,16 +868,20 @@ def _page_train(backend: Backend) -> None:
                 st.warning("Nothing was trained: the feedback buffer is empty. Accept or reject suggestions in "
                            "**② Review & Feedback**, then run training again.")
             elif last:
-                st.success("Supervised head updated! The engine will now use the trained classifier for future inferences.")
+                st.success("Head updated for your session. The CLS scorer now uses it; other visitors are not affected.")
                 f1_col, loss_col, samples_col = st.columns(3)
                 f1 = _f1_score(last)
-                f1_col.metric("F1-Score", f"{f1:.3f}" if f1 is not None else "—",
-                              help="Balance of precision and recall on your feedback, from 0 to 1; higher is better. "
-                                   "Shows “—” if the engine did not report it.")
+                held_out = bool(last.get("f1_held_out"))
+                f1_col.metric(f"F1-Score ({'held-out' if held_out else 'in-sample'})", f"{f1:.3f}" if f1 is not None else "—",
+                              help="Micro F1 over labelled entries only (your accepts and rejects). 'Held-out' = measured on images not "
+                                   "used for fitting; 'in-sample' = too little feedback to hold any out, so it is optimistic.")
                 final_loss = _final_loss(last)
                 loss_col.metric("Final Loss", f"{final_loss:.4f}" if final_loss is not None else "—",
                                 help="Asymmetric loss after the last epoch; lower is better.")
-                samples_col.metric("Samples Trained", last.get("samples", 0), help="Feedback examples used in the last run.")
+                samples_col.metric("Images", last.get("samples", 0), help="Images with feedback used in the last run.")
+                if last.get("batches_per_epoch"):
+                    st.caption(f"{last.get('batches_per_epoch')} mini-batches per epoch · {last.get('replay_rows', 0)} replay rows "
+                               f"from the indexed training data · {last.get('held_out_images', 0)} images held out")
 
                 loss_curve = _float_list(last.get("loss_history"))
                 if loss_curve:
@@ -921,8 +912,9 @@ def main() -> None:
     image, metadata, top_k = _render_input()
     with st.sidebar:
         st.divider()
-        st.metric("Engine state", "Connected" if backend.status == "live" else "Fallback",
-                  help="Connected = the real model is answering. Fallback = demo results from sample data.")
+        st.metric("Engine state", {"artifacts": "Real data", "demo": "Demo KB"}.get(backend.mode, "Mock"),
+                  help="Real data = the engine loaded your artifacts. Demo KB = built-in toy categories, not Commons data. "
+                       "Mock = no engine, fixed sample results.")
         if st.button("Clear current result", use_container_width=True, key="clear_prediction",
                      help="Discards the current results, your accept/reject marks and the held query image. Training history is kept."):
             st.session_state.prediction = None
@@ -942,7 +934,7 @@ def main() -> None:
         with st.spinner("Traversing visual, text, and category signals…"):
             try:
                 _reset_review()
-                st.session_state.prediction = _run_prediction(backend, image, metadata, top_k)
+                st.session_state.prediction = _run_prediction(backend, image, metadata, top_k, _session(backend))
                 st.session_state.last_metadata = metadata
                 # Keep exactly one query image so Accept/Reject can hand it to the engine.
                 st.session_state["_img"] = image

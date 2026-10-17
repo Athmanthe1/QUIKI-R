@@ -108,21 +108,27 @@ class SessionOverlay:
         self.index = NumpyFlatIndex(dim)
         self._row: Dict[str, int] = {}
         self._labels: List[Set[str]] = []
+        self._thumbs: Dict[int, np.ndarray] = {}
 
     @property
     def ntotal(self) -> int:
         return self.index.ntotal
 
-    def accept(self, image_id: str, embedding: np.ndarray, category: str) -> None:
+    def accept(self, image_id: str, embedding: np.ndarray, category: str, thumb: Optional[np.ndarray] = None) -> None:
         if image_id not in self._row:
             self._row[image_id] = self.index.ntotal
             self.index.add(np.asarray(embedding, dtype=np.float32)[None, :])
             self._labels.append(set())
+            if thumb is not None:
+                self._thumbs[self._row[image_id]] = np.asarray(thumb, dtype=np.uint8)
         self._labels[self._row[image_id]].add(category)
 
     def reject(self, image_id: str, category: str) -> None:
         if image_id in self._row:
             self._labels[self._row[image_id]].discard(category)
+
+    def thumb_of_row(self, row: int) -> Optional[np.ndarray]:
+        return self._thumbs.get(row)
 
     def labels_of(self, image_id: str) -> List[str]:
         return sorted(self._labels[self._row[image_id]]) if image_id in self._row else []

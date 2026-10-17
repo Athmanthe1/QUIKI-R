@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 
 from manifest import (DEFAULT_FILES, MANIFEST_NAME, SIGLIP_EMBED_DIM, SIGLIP_MODEL_NAME,  # noqa: F401
-                      Manifest, ManifestError, read_manifest, write_manifest)
+                      Manifest, ManifestError, load_head_npz, read_manifest, save_head_npz, write_manifest)
 
 MODEL_NAME = SIGLIP_MODEL_NAME
 EMBED_DIM = SIGLIP_EMBED_DIM
@@ -94,12 +94,3 @@ class WikimediaClassifier(nn.Module):
             head.fc.weight.copy_(torch.as_tensor(W, dtype=torch.float32))
             head.fc.bias.copy_(torch.as_tensor(b, dtype=torch.float32))
         return head
-
-
-def save_head_npz(path, W: np.ndarray, b: np.ndarray) -> None:
-    np.savez(path, W=np.asarray(W, dtype="float32"), b=np.asarray(b, dtype="float32"))
-
-
-def load_head_npz(path):
-    with np.load(path) as z:
-        return z["W"].astype("float32"), z["b"].astype("float32")
