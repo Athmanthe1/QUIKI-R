@@ -28,15 +28,13 @@ import networkx as nx
 import numpy as np
 from PIL import Image
 
-from dag import load_category_graph, post_process_dag
+from dag import load_category_graph
 from encoders import get_encoder, make_text_prototypes
 from feedback import (FeedbackStore, SessionOverlay, append_event, f1_labelled, holdout_split,
                       image_id_from_embedding, iterate_minibatches, replay_sample)
-from fusion import Stacker, fuse
-from indexing import load_index
-from manifest import MODEL_NAME, ManifestError, load_head_npz, read_manifest
+from manifest import MODEL_NAME
 from protocache import load_or_compute_prototypes
-from scoring import Knowledge, compute_scores
+from scoring import Knowledge, load_knowledge, rank_categories
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 logger = logging.getLogger("CommonsEngine")
@@ -97,45 +95,10 @@ class CategoryEngine:
     # ------------------------------------------------------------------ knowledge
     def load_production_artifacts(self, artifact_dir: Union[str, Path]) -> None:
         """Build a Knowledge from ``<artifact_dir>/manifest.json`` and swap it in atomically."""
-        artifact_dir = Path(artifact_dir)
-        man = read_manifest(artifact_dir, expected_dim=self.embed_dim)
-        index = load_index(man.path(artifact_dir, "index"))
-        id_labels = json.loads(man.path(artifact_dir, "index_labels").read_text(encoding="utf-8"))
-        if index.ntotal != len(id_labels):
-            raise ManifestError(f"index has {index.ntotal} vectors but index_labels has {len(id_labels)} rows")
-        names = man.id_to_class
-        index_labels = [[names[i] for i in row] for row in id_labels]
-
-        thumbs = None
-        tp = man.path(artifact_dir, "thumbs")
-        if tp.is_file():
-            thumbs = np.load(tp, mmap_mode="r")
-            if len(thumbs) != index.ntotal:
-                raise ManifestError(f"thumbs rows ({len(thumbs)}) != index vectors ({index.ntotal})")
-        head = None
-        hp = man.path(artifact_dir, "head")
-        if hp.is_file():
-            W, b = load_head_npz(hp)
-            if W.shape != (len(man.classes), self.embed_dim):
-                raise ManifestError(f"head shape {W.shape} != ({len(man.classes)}, {self.embed_dim})")
-            head = (W, b)
-        stacker = Stacker.load(man.path(artifact_dir, "stacker")) if man.path(artifact_dir, "stacker").is_file() else None
-        protos = load_or_compute_prototypes(artifact_dir, man.classes,
-                                            lambda n: make_text_prototypes(self.encoder, n), man.model_name)
-        notes = []
-        if stacker is None:
-            notes.append("no stacker.json: scores are an uncalibrated mean of the available scorers")
-        if head is None:
-            notes.append("no supervised head: run trainer.py")
-        kn = Knowledge(
-            classes=list(man.classes), prototypes=protos, index=index, index_labels=index_labels, thumbs=thumbs,
-            head=head, graph=load_category_graph(man.path(artifact_dir, "graph")), stacker=stacker,
-            logit_scale=man.logit_scale if man.logit_scale is not None else float(getattr(self.encoder, "logit_scale", np.log(10))),
-            logit_bias=man.logit_bias if man.logit_bias is not None else float(getattr(self.encoder, "logit_bias", -5.0)),
-            source="artifacts", index_type=man.index_type, notes=notes)
+        kn = load_knowledge(artifact_dir, encoder=self.encoder, expected_dim=self.embed_dim)
         self.knowledge = kn                                      # swap in only after everything loaded
         self.status = {"mode": "artifacts", "load_error": None,
-                       "detail": f"{len(kn.classes)} classes, {index.ntotal} indexed images ({man.index_type})"}
+                       "detail": f"{len(kn.classes)} classes, {kn.index.ntotal} indexed images ({kn.index_type})"}
         logger.info("Production artifacts loaded: %s", self.status["detail"])
 
     def _load_default_knowledge_base(self) -> None:
@@ -215,13 +178,13 @@ class CategoryEngine:
         except Exception as exc:
             logger.warning("metadata embedding failed: %r", exc, exc_info=True)
             meta_emb, meta_error = None, repr(exc)
-        scores, neighbours, health = compute_scores(
-            z, meta_emb, kn, overlay=session.overlay if session else None,
-            head=session.head if session is not None and session.head_trained else None, k=n_neighbors)
+        ranked = rank_categories(
+            z, meta_emb, kn, k=n_neighbors, top_k=top_k, dag_threshold=dag_threshold,
+            overlay=session.overlay if session else None,
+            head=session.head if session is not None and session.head_trained else None)
+        suggestions, neighbours, health = ranked["suggestions"], ranked["neighbours"], ranked["health"]
         if meta_error:
             health["meta"] = {"status": "error", "detail": meta_error}
-        fused = fuse(scores, kn.stacker, top_n=200)
-        suggestions = post_process_dag(fused, kn.graph, threshold=dag_threshold)[:top_k]
         for n in neighbours:
             if isinstance(n["image"], np.ndarray):
                 n["image"] = Image.fromarray(np.asarray(n["image"], dtype=np.uint8))

@@ -7,15 +7,22 @@ scorer is reported as such and contributes a missing flag in fusion, never weigh
 """
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import networkx as nx
 import numpy as np
 
+from dag import load_category_graph, post_process_dag
+from encoders import make_text_prototypes
 from feedback import SessionOverlay
-from fusion import DEFAULT_TAU, Scores, Stacker, knn_vote, siglip_text_scores
+from fusion import DEFAULT_TAU, Scores, Stacker, fuse, knn_vote, siglip_text_scores
+from indexing import load_index
+from manifest import ManifestError, load_head_npz, read_manifest
+from protocache import load_or_compute_prototypes
 
 logger = logging.getLogger("CommonsScoring")
 
@@ -138,3 +145,58 @@ def compute_scores(z: np.ndarray, meta_emb: Optional[np.ndarray], kn: Knowledge,
         scores["cls"], health["cls"] = None, {"status": "error", "detail": repr(exc)}
 
     return scores, neighbours, health
+
+
+def load_knowledge(artifact_dir: Union[str, Path], encoder=None, expected_dim: Optional[int] = None) -> Knowledge:
+    """Build a Knowledge from ``<artifact_dir>/manifest.json``. ``encoder`` is only needed if the cached text
+    prototypes are missing. Nothing is returned (or half-built) if any file is inconsistent."""
+    artifact_dir = Path(artifact_dir)
+    man = read_manifest(artifact_dir, expected_dim=expected_dim)
+    index = load_index(man.path(artifact_dir, "index"))
+    id_labels = json.loads(man.path(artifact_dir, "index_labels").read_text(encoding="utf-8"))
+    if index.ntotal != len(id_labels):
+        raise ManifestError(f"index has {index.ntotal} vectors but index_labels has {len(id_labels)} rows")
+    names = man.id_to_class
+    index_labels = [[names[i] for i in row] for row in id_labels]
+    thumbs = None
+    tp = man.path(artifact_dir, "thumbs")
+    if tp.is_file():
+        thumbs = np.load(tp, mmap_mode="r")
+        if len(thumbs) != index.ntotal:
+            raise ManifestError(f"thumbs rows ({len(thumbs)}) != index vectors ({index.ntotal})")
+    head = None
+    hp = man.path(artifact_dir, "head")
+    if hp.is_file():
+        W, b = load_head_npz(hp)
+        if W.shape != (len(man.classes), man.embed_dim):
+            raise ManifestError(f"head shape {W.shape} != ({len(man.classes)}, {man.embed_dim})")
+        head = (W, b)
+    sp = man.path(artifact_dir, "stacker")
+    stacker = Stacker.load(sp) if sp.is_file() else None
+    if encoder is None and not (artifact_dir / "text_prototypes.npy").is_file():
+        raise ManifestError("text_prototypes.npy missing and no encoder given to recompute it")
+    protos = load_or_compute_prototypes(artifact_dir, man.classes,
+                                        (lambda n: make_text_prototypes(encoder, n)) if encoder is not None else (lambda n: (_ for _ in ()).throw(ManifestError("no encoder"))),
+                                        man.model_name)
+    notes = []
+    if stacker is None:
+        notes.append("no stacker.json: scores are an uncalibrated mean of the available scorers")
+    if head is None:
+        notes.append("no supervised head: run trainer.py")
+    return Knowledge(
+        classes=list(man.classes), prototypes=protos, index=index, index_labels=index_labels, thumbs=thumbs, head=head,
+        graph=load_category_graph(man.path(artifact_dir, "graph")), stacker=stacker,
+        logit_scale=man.logit_scale if man.logit_scale is not None else float(getattr(encoder, "logit_scale", np.log(10))),
+        logit_bias=man.logit_bias if man.logit_bias is not None else float(getattr(encoder, "logit_bias", -5.0)),
+        source="artifacts", index_type=man.index_type, notes=notes)
+
+
+def rank_categories(z: np.ndarray, meta_emb: Optional[np.ndarray], kn: Knowledge, *, k: int = 10, top_k: int = 10,
+                    dag_threshold: float = 0.5, overlay: Optional[SessionOverlay] = None,
+                    head: Optional[Tuple[np.ndarray, np.ndarray]] = None, top_n: int = 200) -> Dict[str, Any]:
+    """Embeddings -> ranked suggestions: scorers -> stacked fusion -> DAG post-processing. The single code path
+    used by the engine, fit_stacker.py and evaluate.py. ``fused`` is the full pre-DAG candidate list."""
+    scores, neighbours, health = compute_scores(z, meta_emb, kn, overlay=overlay, head=head, k=k)
+    fused = fuse(scores, kn.stacker, top_n=top_n)
+    suggestions = post_process_dag(fused, kn.graph, threshold=dag_threshold)[:top_k]
+    return {"suggestions": suggestions, "fused": fused, "neighbours": neighbours, "health": health, "scores": scores}
